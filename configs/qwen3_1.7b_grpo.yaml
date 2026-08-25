@@ -1,0 +1,37 @@
+# First target experiment - see docs/EXPERIMENT.md for status (not yet
+# run; this config's structure is fixed now, exact hyperparameters may
+# still be tuned once real runs start in Phase E).
+
+model:
+  name: Qwen/Qwen3-1.7B-Base
+
+algorithm:
+  name: grpo
+
+rollout:
+  backend: quic-vllm
+  workers: 2
+  samples_per_prompt: 8   # GRPO group size
+
+reward:
+  backend: math
+
+trainer:
+  backend: quic-train
+
+synchronization:
+  strategy: checkpoint   # export -> transfer -> reload, see docs/ARCHITECTURE.md
+
+dataset:
+  name: DAPO-Math-17k
+  split: train
+
+evaluation:
+  benchmarks:
+    - math500
+    - aime2024
+    - aime2025
+    - amc2023
+
+max_iterations: 100
+state_dir: ./quic_rl_state
