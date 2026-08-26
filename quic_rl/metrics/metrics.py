@@ -1,14 +1,21 @@
 """Plain JSONL metrics logging - one JSON object per line, deliberately
 the same convention as quic-train's own `training_utils.ExperimentLogger`
-(this ecosystem's established choice: no W&B/TensorBoard dependency,
-trivially `pandas.read_json(lines=True)`-able or greppable).
+(this ecosystem's established choice: no W&B/TensorBoard dependency by
+default, trivially `pandas.read_json(lines=True)`-able or greppable).
 
 Category names match the prompt's own metrics spec exactly (Training/
 Rollout/Network/System/RL) so a reader can trace every tracked field back
 to the requirement that asked for it. Fault-tolerance-only fields (worker
 availability/failures/retries/failed-rollouts/checkpoint-recovery-time)
 are not included - see ARCHITECTURE.md for why that whole category is
-out of scope for this repo."""
+out of scope for this repo.
+
+W&B is strictly OPT-IN and additive - pass `wandb_project` to also mirror
+every record there (namespaced `category/field`, matching the reference
+run's own tracker: `jaygala24/Qwen3-1.7B-GRPO-math-reasoning`'s
+`training_config.yaml` uses `wandb.use_wandb: true`). JSONL stays the
+always-on source of truth either way; nothing about the default (no
+`wandb_project`) path changes."""
 from __future__ import annotations
 
 import json
@@ -16,19 +23,41 @@ import time
 
 
 class MetricsLogger:
-    def __init__(self, path: str | None) -> None:
+    def __init__(
+        self, path: str | None,
+        wandb_project: str | None = None, wandb_run_name: str | None = None,
+        wandb_config: dict | None = None,
+    ) -> None:
         self.path = path
         if path:
             import os
 
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
+        self._wandb_run = None
+        if wandb_project:
+            import wandb
+
+            self._wandb_run = wandb.init(project=wandb_project, name=wandb_run_name, config=wandb_config or {})
+
     def _write(self, category: str, **fields) -> None:
-        if not self.path:
-            return
-        record = {"ts": time.time(), "category": category, **fields}
-        with open(self.path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        iteration = fields.get("iteration")
+        if self.path:
+            record = {"ts": time.time(), "category": category, **fields}
+            with open(self.path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        if self._wandb_run is not None:
+            payload = {f"{category}/{k}": v for k, v in fields.items() if k != "iteration" and v is not None}
+            if payload:
+                self._wandb_run.log(payload, step=iteration)
+
+    def finish(self) -> None:
+        """Closes the W&B run, if one is open - a no-op otherwise. Call
+        once at the end of a run (Controller.run() does not call this
+        itself, since a caller may run Controller.run() more than once
+        against the same MetricsLogger)."""
+        if self._wandb_run is not None:
+            self._wandb_run.finish()
 
     def log_training(self, iteration: int, train_loss: float, reward_mean: float, reward_std: float,
                       completion_rate: float, tokens_per_sec: float, step_time_s: float) -> None:

@@ -68,6 +68,9 @@ class Controller:
         rollout_workers: int = 1,
         reward_workers: int = 1,
         metrics_path: str | None = None,
+        wandb_project: str | None = None,
+        wandb_run_name: str | None = None,
+        wandb_config: dict | None = None,
         max_retry_attempts: int = 3,
         retry_backoff_s: float = 0.0,
     ) -> None:
@@ -79,7 +82,9 @@ class Controller:
         self.sampling = sampling
         self.rollout_workers = rollout_workers
         self.reward_workers = reward_workers
-        self.metrics = MetricsLogger(metrics_path)
+        self.metrics = MetricsLogger(
+            metrics_path, wandb_project=wandb_project, wandb_run_name=wandb_run_name, wandb_config=wandb_config,
+        )
         self.max_retry_attempts = max_retry_attempts
         self.retry_backoff_s = retry_backoff_s
 

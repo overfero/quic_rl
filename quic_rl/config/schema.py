@@ -57,6 +57,13 @@ class EvaluationConfig(BaseModel):
     benchmarks: list[str] = Field(default_factory=list)
 
 
+class WandbConfig(BaseModel):
+    # Opt-in, additive - see MetricsLogger's own docstring. project=None
+    # (default) means W&B stays fully disabled; only JSONL is written.
+    project: str | None = None
+    run_name: str | None = None
+
+
 class ExperimentConfig(BaseModel):
     model: ModelConfig
     algorithm: AlgorithmConfig = AlgorithmConfig()
@@ -66,6 +73,7 @@ class ExperimentConfig(BaseModel):
     synchronization: SynchronizationConfig = SynchronizationConfig()
     dataset: DatasetConfig
     evaluation: EvaluationConfig = EvaluationConfig()
+    wandb: WandbConfig = WandbConfig()
 
     # Orchestration knobs that aren't part of the prompt's example YAML
     # but the training loop genuinely needs - kept here rather than
