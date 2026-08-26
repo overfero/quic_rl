@@ -3,7 +3,7 @@
 # still be tuned once real runs start in Phase E).
 
 model:
-  name: Qwen/Qwen3-1.7B-Base
+  name: Qwen/Qwen3-1.7B
 
 algorithm:
   name: grpo
@@ -23,15 +23,22 @@ synchronization:
   strategy: checkpoint   # export -> transfer -> reload, see docs/ARCHITECTURE.md
 
 dataset:
-  name: DAPO-Math-17k
+  # gsm8k_train + math_train, combined via quic_rl.dataset.math_dataset -
+  # matches the reference reproduction target's real training_config.yaml
+  # (train_dataset_names: [gsm8k_train, math_train]), read directly from
+  # that file, not guessed. This field is descriptive only - the real
+  # loader is quic_rl.dataset.math_dataset.build_prompt_source(), not a
+  # generic load_dataset(config.dataset.name) lookup (see math_grpo.py).
+  name: gsm8k_train+math_train
   split: train
 
 evaluation:
+  # gsm8k_test + math_500 - matches the reproduction target's own real
+  # eval set, not this repo's earlier (wrong) assumption of the
+  # AIME/AMC competition benchmarks.
   benchmarks:
+    - gsm8k_test
     - math500
-    - aime2024
-    - aime2025
-    - amc2023
 
 max_iterations: 100
 state_dir: ./quic_rl_state

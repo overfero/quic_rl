@@ -7,12 +7,22 @@ nothing here is a claimed result without a run backing it.
 
 ## Model
 
-`Qwen/Qwen3-1.7B-Base`.
+`Qwen/Qwen3-1.7B` (instruction-tuned, not `-Base`) - matches the real
+reproduction target's own base model
+(`jaygala24/Qwen3-1.7B-GRPO-math-reasoning`'s `training_config.yaml`:
+`model_path: Qwen/Qwen3-1.7B`). An earlier version of this document
+assumed `-Base`; corrected once that config file was actually read
+rather than guessed.
 
 ## Dataset
 
-Main: DAPO-Math-17k. Sanity check (smaller, faster iteration during
-development): GSM8K.
+`gsm8k_train` + `math_train`, combined (see
+`quic_rl.dataset.math_dataset.load_combined_math_examples`) - matches
+the reproduction target's own real `train_dataset_names: [gsm8k_train,
+math_train]`, read directly from its `training_config.yaml`. Earlier
+versions of this document assumed DAPO-Math-17k, before that config was
+actually read. Training hyperparameters are NOT required to match the
+reference exactly - only model and dataset need to.
 
 ## Reward
 
@@ -32,13 +42,14 @@ happens (pending Phase E).
 
 ## Hardware / network topology
 
-Available now: this local session plus 3 SSH-reachable machines (2×T4
-each, ~15GB/GPU), matching the real multi-Kaggle-session target this
-architecture was designed for (no NVLink/InfiniBand/shared filesystem/
-static IP assumed anywhere — see `ARCHITECTURE.md`). Exact machine-to-
-role assignment (which machine(s) run quic-train's training ranks, which
-run quic-vllm's pipeline stages) will be recorded here once a real
-deployment happens (pending Phase C/E).
+Two dedicated real machines (2×T4 each, ~15GB/GPU), matching the real
+multi-Kaggle-session target this architecture was designed for (no
+NVLink/InfiniBand/shared filesystem/static IP assumed anywhere — see
+`ARCHITECTURE.md`): one runs quic-train's GRPO training ranks
+(`full_finetune=True`, `world_size=2`), the other runs quic-vllm's
+rollout deployment. Weight sync between them uses `quic_dist`'s own QUIC
+transport (`QuicWeightSynchronizer`), not scp/ssh — see
+`ARCHITECTURE.md`'s "Weight synchronization" section.
 
 ## Benchmark methodology
 
