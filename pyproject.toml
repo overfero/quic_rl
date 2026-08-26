@@ -25,6 +25,10 @@ real = [
     "transformers>=4.40",
     "datasets>=2.18",
 ]
+# Opt-in - see MetricsLogger's own docstring (JSONL stays the default,
+# W&B is additive). Separate extra from `real` since tracking is a
+# choice independent of which backends are wired up.
+tracking = ["wandb>=0.16"]
 dev = ["pytest>=7.0"]
 
 [tool.setuptools]
