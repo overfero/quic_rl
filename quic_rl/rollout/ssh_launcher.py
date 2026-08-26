@@ -145,21 +145,33 @@ class SshMultiMachineStageLauncher:
                     f"--num-gpu-blocks-override {self.num_gpu_blocks_override}"
                 )
             else:
+                # n==1 (this machine is the ONLY stage, e.g. the 2-machine
+                # train/infer topology's inference side): no prev stage, no
+                # remote stages at all - launch_pp_stage.py itself requires
+                # --prev-name be OMITTED (not passed empty/"None") whenever
+                # pp_rank==0, and only turns on the real transport/RPC
+                # machinery when --remote-stage-names is actually given
+                # (falls back to vanilla vLLM's own "mp" executor otherwise -
+                # see that script's own main()). Real bug hit building this:
+                # an earlier version always included both flags, rendering
+                # literal "--prev-name None" / an empty "--remote-stage-names"
+                # value that broke argparse for exactly this n==1 case.
                 remote_names = ",".join(wire_names[:-1])
                 cmd = (
                     f"{self._env_prefix(m)} nohup python3 -u "
                     f"{self.vllm_repo_dir}/scripts/launch_pp_stage.py "
                     f"--pp-rank {rank} --pp-world-size {n} "
-                    f"--self-name {self_name} --prev-name {prev_name} "
-                    f"--transport quic --signaling-url {self.signaling_url} "
+                    f"--self-name {self_name} "
+                    + (f"--prev-name {prev_name} " if prev_name else "")
+                    + f"--transport quic --signaling-url {self.signaling_url} "
                     f"--transport-connect-timeout {self.transport_connect_timeout} "
                     f"--model {stage_dir} --tensor-parallel-size 1 --dtype float16 "
                     f"--gpu-memory-utilization {self.gpu_memory_utilization} "
                     f"--max-model-len {self.max_model_len} "
                     f"--max-num-seqs {self.max_num_seqs} "
                     f"--serve --host 0.0.0.0 --port {self.driver_port} "
-                    f"--remote-stage-names {remote_names} --rpc-port {self.rpc_port} "
-                    f"--num-gpu-blocks-override {self.num_gpu_blocks_override}"
+                    + (f"--remote-stage-names {remote_names} --rpc-port {self.rpc_port} " if remote_names else "")
+                    + f"--num-gpu-blocks-override {self.num_gpu_blocks_override}"
                 )
 
             log_path = f"{self.remote_log_dir}/quic_rl_stage_{m.name}.log"

@@ -63,6 +63,12 @@ class QuicTrainBackend:
     state_dir: str  # rollout batch/result files + the written GRPOConfig live under here
 
     cuda_devices: list[str] | None = None  # one entry per rank; defaults to "0".."world_size-1"
+    # True: genuine full-parameter fine-tuning (no LoRA) - see
+    # finetune.PipelineConfig.full_finetune's own docstring for the real
+    # mechanics/constraints. Requires quantization="none" and kl_coef=0.0
+    # (checked in initialize_policy() - fails loudly rather than
+    # launching rank processes that would crash on the first real step).
+    full_finetune: bool = False
     lora_r: int = 8
     lora_alpha: int = 16
     lora_target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
@@ -71,6 +77,9 @@ class QuicTrainBackend:
     max_prompt_len: int = 512
     kl_coef: float = 0.05
     lr: float = 1e-4
+    # Micro-steps accumulated before a real optimizer.step() - see
+    # quic_dist.rlhf.run_grpo_training_from_rollouts's own docstring.
+    gradient_accumulation_steps: int = 1
     job_id: str = "quic_rl_grpo"
     step_result_timeout_s: float = 600.0
     step_result_poll_interval_s: float = 1.0
@@ -95,6 +104,19 @@ class QuicTrainBackend:
         return self._RolloutBatch
 
     def initialize_policy(self, policy_path: str) -> int:
+        if self.full_finetune and self.quantization != "none":
+            raise ValueError(
+                f"QuicTrainBackend: full_finetune=True requires quantization='none' (got "
+                f"{self.quantization!r}) - see finetune.PipelineConfig.full_finetune's docstring"
+            )
+        if self.full_finetune and self.kl_coef != 0.0:
+            raise ValueError(
+                "QuicTrainBackend: full_finetune=True requires kl_coef=0.0 - a full-parameter "
+                "model has no LoRA adapter for the free-reference-model trick to disable, and "
+                "quic-train's GRPO path only skips the reference forward pass when kl_coef==0 "
+                "(see rlhf.py's _grpo_update_from_rollout)"
+            )
+
         os.makedirs(self.state_dir, exist_ok=True)
         self._rollout_dir = os.path.join(self.state_dir, "rollouts")
         os.makedirs(self._rollout_dir, exist_ok=True)
@@ -103,6 +125,7 @@ class QuicTrainBackend:
             "model_path": policy_path,
             "world_size": self.world_size,
             "num_layers": self.num_layers,
+            "full_finetune": self.full_finetune,
             "lora_r": self.lora_r,
             "lora_alpha": self.lora_alpha,
             "lora_target_modules": self.lora_target_modules,
@@ -111,6 +134,7 @@ class QuicTrainBackend:
             "max_prompt_len": self.max_prompt_len,
             "kl_coef": self.kl_coef,
             "lr": self.lr,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
         }
         self._config_path = os.path.join(self.state_dir, "grpo_config.yaml")
         with open(self._config_path, "w") as f:
