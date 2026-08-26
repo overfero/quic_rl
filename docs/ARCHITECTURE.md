@@ -171,34 +171,65 @@ wrapping the whole chain in a brace group (`{ mkdir -p X && CMD; } <
 /dev/null > log 2>&1 & disown`) so the redirection covers the entire
 group, not just its last simple command.
 
-**`QuicTrainBackend.export_policy()`'s real implementation** turned out
-simpler than the LoRA-merge plan above once the project moved to
-`full_finetune=True`: no adapter, so no merge step - the live model
-already IS the full checkpoint. It does NOT load a second model copy in
-the orchestrator process (a real RAM-exhaustion bug found running this
-for real: quic-train's rank subprocesses never exit between `train()`
-calls, so a second full-model load in a separate process while both
-stayed resident pushed a real 31GB-RAM box over its ceiling - not a
-GPU/VRAM problem, the GPUs had headroom the whole time). Instead it
-writes a file-based export *request* that rank 0 services directly from
-its own already-GPU-resident model (`peft_model.save_pretrained()`),
+**`QuicTrainBackend.export_policy()`'s real implementation** avoids
+loading a second model copy in the orchestrator process (a real RAM-
+exhaustion bug found running this for real: quic-train's rank
+subprocesses never exit between `train()` calls, so a second full-model
+load in a separate process while both stayed resident pushed a real
+31GB-RAM box over its ceiling - not a GPU/VRAM problem, the GPUs had
+headroom the whole time). It writes a file-based export *request*,
 checked both right after each real checkpoint and during the rank's own
 idle poll for the next batch (the latter closes a real deadlock: without
 it, a request arriving while the rank is idly waiting for the next
 training batch - which is exactly when `export_policy()` is normally
 called - would never get serviced).
 
+Servicing that request went through a real design change. The first
+version had rank 0 alone call `peft_model.save_pretrained()`, reasoning
+"no adapter, so no merge step - the live model already IS the full
+checkpoint." That reasoning turned out to depend on an unrelated, real
+bug: `build_stage_model()` (quic-train's `finetune.py`) loaded the WHOLE
+model on every rank even though `full_finetune`'s pipeline split only
+ever computes each rank's own layer slice - every rank held
+weights+gradients+AdamW state for all 28 layers (~13.6GB static for a
+1.7B model), OOM'ing a 15GB T4 even at `group_size=8`. Fixing that (drop
+non-owned layers/embed/lm_head from the live model right after loading,
+mirroring what the quantized/LoRA path already did via
+`build_device_map`) is real and necessary - trainable params per rank
+measured ~1.02B afterward, down from 2.03B, and a training step that
+previously OOM'd now completes cleanly - but it means NO SINGLE RANK
+holds a complete model any more, so "rank 0 alone has everything" is no
+longer true. `export_policy()` now uses a shard-then-merge protocol
+instead: every rank writes its own layer/embed/lm_head state dict, rank
+0 waits for every rank's shard and reassembles one complete model via
+`merge_stage_shards()` (loaded fresh on CPU - no GPU needed, so it
+doesn't compete with the training ranks' own GPU memory), then saves it.
+Validated end-to-end: the exported model reloads with all 28 layers and
+the correct full param count.
+
 **Known limitation, found running this for real**: the exported
 checkpoint does not preserve Qwen3's `embed_tokens`/`lm_head` weight
-tying - `save_pretrained()` on the live model wrote both as independent
-full tensors (confirmed directly via the `.safetensors` file: both
-`lm_head.weight` and `model.embed_tokens.weight` present at full size,
-151936×2048 each), inflating the reported param count by exactly that
-tensor's size (311,164,928) and the checkpoint by ~600MB (~18%) versus a
-properly-tied save. Believed harmless for this repo's actual use of the
-export (inference serving only - vLLM just needs numerically-correct
-values, not object-level tying, and nothing ever reloads an export back
-into training), but not yet fixed at the source.
+tying. In the ORIGINAL Qwen3-1.7B checkpoint these are the SAME
+tensor object - tying means "one set of numbers, read twice" (as an
+embedding table AND as the output projection), not two copies that
+happen to match. Splitting the model across ranks breaks this by
+construction: rank 0 keeps `embed_tokens`, the last rank keeps
+`lm_head`, and once they're two independent tensors in two separate
+processes there is no way for training to keep them equal (nothing
+in this repo re-ties them after every gradient step - doing so would
+require a cross-rank sync on every step, real added communication for a
+property this repo's actual use doesn't need). `merge_stage_shards()`
+explicitly untangles them for exactly this reason (a shell model still
+tied to the original checkpoint would otherwise have one shard's
+`load_state_dict()` silently overwrite the other's values, since
+`load_state_dict` copies in place into whatever tensor object is
+currently there). The result: the exported checkpoint has both as
+independent full tensors, inflating the reported param count by exactly
+that tensor's size (311,164,928) and the checkpoint by ~600MB (~18%)
+versus a properly-tied save. Believed harmless for this repo's actual
+use of the export (inference serving only - vLLM just needs
+numerically-correct values, not object-level tying, and nothing ever
+reloads an export back into training).
 
 ## Failure handling
 
