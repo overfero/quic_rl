@@ -5,7 +5,7 @@ implementation; `MockRolloutBackend` (mock.py) is a GPU-free stand-in used
 by every orchestrator test and `examples/mock_loop.py`."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from quic_rl.trajectory import Trajectory
@@ -26,6 +26,13 @@ class GenerationRequest:
     prompt_id: str
     prompt: str
     num_samples: int = 1
+    # Carried through unchanged into every resulting Trajectory.metadata
+    # (merged with whatever generation-specific fields the backend adds,
+    # e.g. sample_index) - e.g. MathVerifierReward needs
+    # metadata["ground_truth"] to grade a response; this is how a
+    # prompt_source attaches it per-prompt without RolloutBackend
+    # needing to know anything about reward-specific fields.
+    metadata: dict = field(default_factory=dict)
 
 
 @runtime_checkable

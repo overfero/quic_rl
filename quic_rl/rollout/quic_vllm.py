@@ -137,6 +137,7 @@ class QuicVLLMRollout:
                         token_ids=choice.get("token_ids"),
                         logprobs=logprobs_obj.get("token_logprobs"),
                         metadata={
+                            **req.metadata,
                             "sample_index": choice["index"],
                             "finish_reason": choice.get("finish_reason"),
                             "backend": "quic_vllm",

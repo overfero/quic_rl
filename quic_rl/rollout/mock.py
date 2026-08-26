@@ -40,7 +40,7 @@ class MockRolloutBackend:
                         response=response,
                         token_ids=token_ids,
                         logprobs=[-abs(self._rng.gauss(1.0, 0.5)) for _ in token_ids],
-                        metadata={"sample_index": i, "backend": "mock"},
+                        metadata={**req.metadata, "sample_index": i, "backend": "mock"},
                     )
                 )
         return out
