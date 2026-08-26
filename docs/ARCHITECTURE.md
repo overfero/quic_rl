@@ -138,6 +138,68 @@ requires every cost field the integration architecture measures: weight
 size, transfer time, sync time, reload time, total overhead. Nothing
 about this repo's benchmarking can accidentally omit these.
 
+**`QuicWeightSynchronizer`'s real `transfer` step uses `quic_dist`'s QUIC
+`ProcessGroup`** (`quic_rl/synchronization/quic_transfer.py`), NOT
+`vllm/transport/quic_transport.py` and NOT `scp`/`ssh`. Why not vLLM's
+own transport: it can only be imported through the full `vllm` package,
+which eagerly resolves the CUDA platform at import time - a real,
+working quic-vllm build has to already be present, which the training
+machine has no reason to carry. Why not scp/ssh: this project's SSH
+tunnels have a documented ~5GB/day budget that a repeated multi-GB
+checkpoint sync would exhaust in roughly one sync. `quic_dist`, by
+contrast, is genuinely standalone (no vLLM dependency - see
+`process_group.py`'s own module docstring) and is already deployed on
+the training machine for actual training traffic, so reusing it for a
+second purpose (an ad-hoc, throwaway 2-rank process group per sync call,
+torn down immediately after) costs nothing extra to deploy. SSH is used
+only to start the remote side of each transfer (`quic_transfer.py`'s own
+CLI, `nohup ... & disown` over a control-plane SSH command) - the weight
+bytes themselves travel entirely over the QUIC path, so a sync's cost
+never touches the SSH budget regardless of checkpoint size. Real-world
+throughput measured between this project's actual two machines (Council
+Bluffs, Iowa and Groningen, Netherlands - genuinely different continents)
+was ~0.94 MB/s, byte-exact (sha256-verified) - slow enough that sync
+frequency, not correctness, is the real constraint on this path for a
+multi-GB checkpoint.
+
+Real bug found deploying this: `mkdir -p X && CMD < /dev/null > log 2>&1
+& disown` over SSH does NOT fully detach - the I/O redirection after
+`CMD` only applies to `CMD`, not to `mkdir`, so `mkdir`'s own stdio stays
+attached to the SSH session's pty and the whole channel hangs open
+indefinitely even though the visible command already returned. Fixed by
+wrapping the whole chain in a brace group (`{ mkdir -p X && CMD; } <
+/dev/null > log 2>&1 & disown`) so the redirection covers the entire
+group, not just its last simple command.
+
+**`QuicTrainBackend.export_policy()`'s real implementation** turned out
+simpler than the LoRA-merge plan above once the project moved to
+`full_finetune=True`: no adapter, so no merge step - the live model
+already IS the full checkpoint. It does NOT load a second model copy in
+the orchestrator process (a real RAM-exhaustion bug found running this
+for real: quic-train's rank subprocesses never exit between `train()`
+calls, so a second full-model load in a separate process while both
+stayed resident pushed a real 31GB-RAM box over its ceiling - not a
+GPU/VRAM problem, the GPUs had headroom the whole time). Instead it
+writes a file-based export *request* that rank 0 services directly from
+its own already-GPU-resident model (`peft_model.save_pretrained()`),
+checked both right after each real checkpoint and during the rank's own
+idle poll for the next batch (the latter closes a real deadlock: without
+it, a request arriving while the rank is idly waiting for the next
+training batch - which is exactly when `export_policy()` is normally
+called - would never get serviced).
+
+**Known limitation, found running this for real**: the exported
+checkpoint does not preserve Qwen3's `embed_tokens`/`lm_head` weight
+tying - `save_pretrained()` on the live model wrote both as independent
+full tensors (confirmed directly via the `.safetensors` file: both
+`lm_head.weight` and `model.embed_tokens.weight` present at full size,
+151936×2048 each), inflating the reported param count by exactly that
+tensor's size (311,164,928) and the checkpoint by ~600MB (~18%) versus a
+properly-tied save. Believed harmless for this repo's actual use of the
+export (inference serving only - vLLM just needs numerically-correct
+values, not object-level tying, and nothing ever reloads an export back
+into training), but not yet fixed at the source.
+
 ## Failure handling
 
 **In scope**: orchestrator-level checkpoint/resume

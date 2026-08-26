@@ -30,12 +30,21 @@ role for quic-vllm: prove the real pipeline correctness here first. An
 SSH multi-machine trainer launcher (mirroring `rollout/ssh_launcher.py`)
 is real future work, not built yet.
 
-`export_policy()`/`checkpoint()` are NOT implemented yet - quic-train's
-GRPO path has no checkpoint/export wiring at all currently (see
-`run_grpo_training_from_rollouts`'s own docstring: "No seed/checkpoint/
-log wiring here"). Wiring real weight export (LoRA -> WeightSynchronizer)
-is the next real chunk of work; raising `NotImplementedError` here is
-honest about that gap rather than faking a result.
+`export_policy()`/`checkpoint()`: real. `checkpoint()` copies the raw
+per-rank checkpoint files (full optimizer/RNG state, for training
+resume) verbatim, backed by `run_grpo_training_from_rollouts`'s own
+`training_utils.save_checkpoint` wiring. `export_policy()` does NOT load
+a model in this (orchestrator) process at all - it sends a file-based
+export REQUEST that rank 0's own `on_checkpoint` hook services directly
+from its already-GPU-resident model (see
+`grpo_external_rollout_rank.py`'s `_check_export_request`), then just
+copies the (static, training never changes it) tokenizer files here.
+Real bug this fixes: an earlier version loaded a SECOND full model copy
+in this process for export - rank processes never exit between train()
+calls, so with both still resident that second load pushed a real
+machine over its actual RAM ceiling (not a GPU/VRAM problem - the GPUs
+had headroom the whole time; this was host RAM exhaustion from 3
+simultaneous full-model loads on one box).
 """
 from __future__ import annotations
 
@@ -60,7 +69,16 @@ class QuicTrainBackend:
     signaling_url: str
     world_size: int
     num_layers: int
-    state_dir: str  # rollout batch/result files + the written GRPOConfig live under here
+    # Rollout batch/result files + the written GRPOConfig live under
+    # here, AND (checkpoints/checkpoints/) - real disk usage found
+    # running this for real: one full-parameter checkpoint is ~7.5GB
+    # PER RANK, and with checkpoint_keep_last=2 plus one "best" copy
+    # (see rlhf.py's own checkpoint-saving docstring) that's up to
+    # ~22.5GB/rank, ~45GB total for world_size=2 - MUST be a real disk
+    # path (e.g. under /data), never /kaggle/working, which is commonly
+    # just a small (~20GB) loop device that filled up completely from
+    # exactly this during development.
+    state_dir: str
 
     cuda_devices: list[str] | None = None  # one entry per rank; defaults to "0".."world_size-1"
     # True: genuine full-parameter fine-tuning (no LoRA) - see
@@ -90,8 +108,11 @@ class QuicTrainBackend:
     _RolloutBatch: object | None = field(default=None, init=False, repr=False)
     _policy_version: int | None = field(default=None, init=False, repr=False)
     _next_step: int = field(default=1, init=False, repr=False)
+    _next_export_id: int = field(default=0, init=False, repr=False)
     _rollout_dir: str = field(default="", init=False, repr=False)
     _config_path: str = field(default="", init=False, repr=False)
+    _checkpoint_dir: str = field(default="", init=False, repr=False)
+    _policy_path: str = field(default="", init=False, repr=False)
 
     def _rollout_batch_cls(self):
         if self._RolloutBatch is None:
@@ -120,6 +141,8 @@ class QuicTrainBackend:
         os.makedirs(self.state_dir, exist_ok=True)
         self._rollout_dir = os.path.join(self.state_dir, "rollouts")
         os.makedirs(self._rollout_dir, exist_ok=True)
+        self._checkpoint_dir = os.path.join(self.state_dir, "checkpoints")
+        self._policy_path = policy_path
 
         cfg = {
             "model_path": policy_path,
@@ -135,6 +158,9 @@ class QuicTrainBackend:
             "kl_coef": self.kl_coef,
             "lr": self.lr,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "checkpoint_dir": self._checkpoint_dir,
+            "checkpoint_every": 1,  # every real optimizer.step() (window), not every micro-batch
+            "checkpoint_keep_last": 2,
         }
         self._config_path = os.path.join(self.state_dir, "grpo_config.yaml")
         with open(self._config_path, "w") as f:
@@ -259,18 +285,79 @@ class QuicTrainBackend:
             raise RuntimeError("QuicTrainBackend: policy not initialized yet")
         return self._policy_version
 
+    def _quic_dist_training_utils(self):
+        # training_utils.py is a bare top-level module inside quic_dist's
+        # OWN repo root (not a quic_dist.training_utils submodule import),
+        # matching a real, pre-existing pattern rlhf.py itself uses - it
+        # only resolves when the repo root itself is on sys.path, not
+        # just its parent (which is enough for `import quic_dist` alone).
+        # Same real bug hit in grpo_external_rollout_rank.py, fixed the
+        # same way there.
+        repo_root = os.path.abspath(self.quic_dist_repo_dir)
+        parent = os.path.dirname(repo_root)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        import training_utils
+
+        return training_utils
+
     def export_policy(self, output_dir: str) -> str:
-        raise NotImplementedError(
-            "QuicTrainBackend.export_policy(): quic-train's GRPO path has no checkpoint/export "
-            "wiring yet (see run_grpo_training_from_rollouts's own docstring) - real weight "
-            "export back to the rollout engine is the next chunk of work, not built yet."
-        )
+        if not self._checkpoint_dir:
+            raise RuntimeError("QuicTrainBackend.export_policy() called before initialize_policy()")
+
+        # Real RAM-exhaustion bug found running this for real: rank
+        # processes never exit between train() calls, so a SECOND full
+        # model load here (a separate orchestrator process, on the SAME
+        # machine) pushed a real box over its actual RAM ceiling with
+        # both rank processes still resident. Fixed by asking rank 0
+        # (the one that, in today's full_finetune non-sharded reality,
+        # already holds the complete model on its own GPU - see
+        # build_stage_model's own docstring) to serialize DIRECTLY from
+        # its already-loaded model instead - no second copy anywhere.
+        # See grpo_external_rollout_rank.py's _check_export_request()
+        # for the rank-side half of this file-based protocol.
+        self._next_export_id += 1
+        request_id = self._next_export_id
+        request_path = os.path.join(self._rollout_dir, "export_request.json")
+        tmp_path = request_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump({"output_dir": output_dir, "request_id": request_id}, f)
+        os.rename(tmp_path, request_path)
+
+        done_path = os.path.join(self._rollout_dir, f"export_done_{request_id}.json")
+        deadline = time.monotonic() + self.step_result_timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(done_path):
+                break
+            time.sleep(self.step_result_poll_interval_s)
+        else:
+            raise RuntimeError(
+                f"QuicTrainBackend.export_policy(): rank 0 never serviced the export request within "
+                f"{self.step_result_timeout_s}s - check quic_train_rank0.log under {self.state_dir}"
+            )
+
+        # The model weights are already written by rank 0 above - the
+        # tokenizer is static (training never changes it), so copying it
+        # here (cheap: no model load, just small JSON/text files) is all
+        # that's left to make output_dir a complete, real HF checkpoint.
+        self._tokenizer.save_pretrained(output_dir)
+        return output_dir
 
     def checkpoint(self, output_dir: str) -> str:
-        raise NotImplementedError(
-            "QuicTrainBackend.checkpoint(): quic-train's GRPO path has no checkpoint wiring yet "
-            "(see run_grpo_training_from_rollouts's own docstring) - not built yet."
-        )
+        if not self._checkpoint_dir:
+            raise RuntimeError("QuicTrainBackend.checkpoint() called before initialize_policy()")
+        training_utils = self._quic_dist_training_utils()
+        import shutil
+
+        os.makedirs(output_dir, exist_ok=True)
+        for rank in range(self.world_size):
+            ckpt_path = training_utils.find_latest_checkpoint(self._checkpoint_dir, rank=rank)
+            if ckpt_path is None:
+                raise RuntimeError(f"QuicTrainBackend.checkpoint(): no checkpoint found for rank {rank}")
+            shutil.copy2(ckpt_path, os.path.join(output_dir, os.path.basename(ckpt_path)))
+        return output_dir
 
     def health_check(self) -> bool:
         return self._policy_version is not None and all(p.poll() is None for p in self._procs)
