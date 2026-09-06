@@ -131,9 +131,34 @@ def main() -> None:
     initial_version = lifecycle.initialize(rollout, trainer, initial_policy_path=args.model_path)
 
     # quic-train's rank subprocess just launched (inside initialize_policy())
-    # and is already touching the TPU; give it a real head start before
-    # LocalVLLMRollout's OWN first generate() call starts its worker and
-    # touches the TPU too - see --tpu-init-stagger-s's own help text.
+    # and is already touching the TPU. A FIXED sleep here isn't enough -
+    # confirmed directly: vLLM's worker still got rejected
+    # (`Unknown command line flag 'xla_tpu_use_dynamic_smem_negotiation'`)
+    # a full 33s, 55s, AND 76s after the rank process's own first TPU
+    # touch, i.e. this host's shared libtpu coordination service stays
+    # "locked" to the rank process's flag set for its ENTIRE active
+    # compile/sharding phase, not just its initial attach instant - so
+    # wait for a REAL readiness signal (`grpo_external_rollout_rank.py`'s
+    # own "all ranks finished loading, starting training" print, the
+    # point where rank goes idle polling for rollouts) instead of
+    # guessing a sleep duration, THEN add `--tpu-init-stagger-s` on top
+    # as a real safety margin for whatever's happening right after that
+    # log line lands.
+    rank_log_path = os.path.join(args.state_dir, f"quic_train_rank{trainer.world_size - 1}.log")
+    deadline = time.monotonic() + 600.0
+    ready = False
+    while time.monotonic() < deadline:
+        if os.path.exists(rank_log_path):
+            with open(rank_log_path) as f:
+                if "all ranks finished loading, starting training" in f.read():
+                    ready = True
+                    break
+        time.sleep(1.0)
+    if not ready:
+        raise RuntimeError(
+            f"quic-train's rank process never reached its 'starting training' readiness "
+            f"line within 600s - see {rank_log_path} for what actually happened"
+        )
     time.sleep(args.tpu_init_stagger_s)
 
     from transformers import AutoTokenizer
