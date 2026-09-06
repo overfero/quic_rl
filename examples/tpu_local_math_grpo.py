@@ -48,7 +48,58 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
+
+# MUST happen before QuicTrainBackend/LocalVLLMRollout spawn their rank/
+# worker subprocesses (both inherit this via plain `dict(os.environ)`
+# copies) - real crash found running this for real: torch_xla and
+# vLLM-TPU's tpu_inference backend each set their OWN default
+# LIBTPU_INIT_ARGS (torch_xla's own __init__.py; tpu_inference's
+# env_override.py unconditionally prepends
+# `--xla_tpu_use_dynamic_smem_negotiation=true`) - whichever process's
+# subprocess touches the TPU FIRST registers its flags with this host's
+# shared libtpu runtime coordination service (the "SliceBuilder" service
+# named in that service's own warning), and the OTHER process's later,
+# DIFFERING flag set gets rejected outright
+# (`ERROR: Unknown command line flag 'xla_tpu_use_dynamic_smem_negotiation'`,
+# confirmed directly - this is a HOST-level init race, not a per-process
+# one, unlike TPU_VISIBLE_CHIPS/TPU_CHIPS_PER_PROCESS_BOUNDS which really
+# are per-process). Pre-setting the flag tpu_inference wants here means
+# torch_xla's own `_set_missing_flags()` (additive, never overwrites an
+# existing flag) just adds its usual defaults on top instead of leaving
+# it unset - both processes end up agreeing on it regardless of launch
+# order.
+#
+# Pre-setting ONLY tpu_inference's flag turned out not to be enough -
+# confirmed directly via a standalone concurrent-race test: torch_xla's
+# OWN `_setup_libtpu_flags()` (torch_xla/__init__.py) then ADDS SIX more
+# of ITS OWN default flags on top (additive, `_set_missing_flags`,
+# real ones - see that function's own comments for why each exists:
+# `xla_tpu_use_enhanced_launch_barrier=false`, `xla_latency_hiding_
+# scheduler_rerun=1`, `xla_tpu_prefer_async_allgather_to_allreduce=true`,
+# `xla_tpu_enable_flash_attention=false`,
+# `xla_enable_async_all_gather=true`,
+# `xla_enable_async_collective_permute=true` on v5), while tpu_inference
+# only duplicates its own single flag - so the two processes' FINAL
+# strings still didn't match, and whichever one's subprocess reached
+# this host's shared libtpu runtime coordination service SECOND still
+# got rejected (confirmed: it happened to torch_xla's side that time,
+# not vLLM's - a true race, not one side being "wrong"). Pre-baking
+# torch_xla's own complete default set here means its own
+# `_set_missing_flags()` finds everything already present by name and
+# adds nothing further, so both processes' final strings end up
+# byte-identical (mod tpu_inference's harmless exact-duplicate prepend).
+os.environ.setdefault(
+    "LIBTPU_INIT_ARGS",
+    "--xla_tpu_use_dynamic_smem_negotiation=true "
+    "--xla_tpu_use_enhanced_launch_barrier=false "
+    "--xla_latency_hiding_scheduler_rerun=1 "
+    "--xla_tpu_prefer_async_allgather_to_allreduce=true "
+    "--xla_tpu_enable_flash_attention=false "
+    "--xla_enable_async_all_gather=true "
+    "--xla_enable_async_collective_permute=true",
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -83,6 +134,13 @@ def main() -> None:
     p.add_argument("--max-iterations", type=int, default=1)
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--wandb-run-name", default=None)
+    p.add_argument("--tpu-init-stagger-s", type=float, default=20.0,
+                    help="delay between starting quic-train's rank process and vLLM's worker - "
+                         "see this file's own LIBTPU_INIT_ARGS comment for why: even with IDENTICAL "
+                         "flags, confirmed directly that two processes touching this host's TPU at "
+                         "the same wall-clock instant race on a shared local coordination service "
+                         "and one of them gets rejected outright; staggering by a real margin (not a "
+                         "flag fix) is what actually avoids it")
     args = p.parse_args()
 
     rollout = LocalVLLMRollout(
@@ -104,6 +162,12 @@ def main() -> None:
     weight_synchronizer = LocalWeightSynchronizer()
 
     initial_version = lifecycle.initialize(rollout, trainer, initial_policy_path=args.model_path)
+
+    # quic-train's rank subprocess just launched (inside initialize_policy())
+    # and is already touching the TPU; give it a real head start before
+    # LocalVLLMRollout's OWN first generate() call starts its worker and
+    # touches the TPU too - see --tpu-init-stagger-s's own help text.
+    time.sleep(args.tpu_init_stagger_s)
 
     from transformers import AutoTokenizer
 
