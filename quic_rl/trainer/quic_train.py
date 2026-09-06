@@ -119,6 +119,15 @@ class QuicTrainBackend:
     max_prompt_len: int = 512
     kl_coef: float = 0.05
     lr: float = 1e-4
+    # Global-norm gradient clipping / AdamW weight decay - see
+    # quic_dist.rlhf._grpo_update_from_rollout's/
+    # run_grpo_training_from_rollouts's own `getattr(config, ..., 0.0)`
+    # reads (added for this project's real HF-model-recreation config
+    # match, e.g. jaygala24/Qwen3-1.7B-GRPO-math-reasoning's
+    # grad_clip=0.3/weight_decay=0.01) - 0.0 (default, both) = disabled,
+    # completely unchanged behavior from before these fields existed.
+    grad_clip: float = 0.0
+    weight_decay: float = 0.0
     # Micro-steps accumulated before a real optimizer.step() - see
     # quic_dist.rlhf.run_grpo_training_from_rollouts's own docstring.
     gradient_accumulation_steps: int = 1
@@ -183,6 +192,8 @@ class QuicTrainBackend:
             "max_prompt_len": self.max_prompt_len,
             "kl_coef": self.kl_coef,
             "lr": self.lr,
+            "grad_clip": self.grad_clip,
+            "weight_decay": self.weight_decay,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "checkpoint_dir": self._checkpoint_dir,
             "checkpoint_every": 1,  # every real optimizer.step() (window), not every micro-batch

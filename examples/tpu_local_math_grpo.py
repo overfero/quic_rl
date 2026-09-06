@@ -20,6 +20,19 @@ landed, against QuicVLLMRollout's cross-machine HTTP-driver model and
 an outdated QuicTrainBackend constructor shape - not runnable as-is),
 this script targets the ACTUAL current backend interfaces directly.
 
+QuicTrainBackend's own hyperparameters here (kl_coef=0.0, lr=1e-6,
+grad_clip=0.3, weight_decay=0.01) match
+jaygala24/Qwen3-1.7B-GRPO-math-reasoning's model card exactly - see
+quic_dist/examples/configs/tpu_qwen3_1.7b_grpo_math_real.yaml's own
+comments for the same reproduction via quic_dist's OWN generation path
+(run_grpo_math_training) instead of this file's vLLM-rollout path.
+`--group-size` defaults to 8, not the reference's 16: confirmed
+directly that group_size=16 OOMs `_grpo_update_from_rollout`'s
+GSM8K-forced fp32 logits cast even at tensor_parallel_size=8 (see
+rlhf.py's own history) - splitting 2 chips off for vLLM leaves
+quic-train only 6, making that OOM MORE likely, not less, so 8 stays
+the real, working ceiling until that cast gets a genuine memory fix.
+
 Run:
   python3 examples/tpu_local_math_grpo.py \\
     --quic-dist-repo-dir /kaggle/working/quic_dist \\
@@ -28,7 +41,7 @@ Run:
     --hf-home /hf_cache \\
     --vllm-tensor-parallel-size 2 \\
     --quic-train-tensor-parallel-size 6 \\
-    --max-iterations 2
+    --max-iterations 8
 """
 from __future__ import annotations
 
@@ -84,6 +97,8 @@ def main() -> None:
         quantization="none", compute_dtype="bfloat16", tensor_parallel_size=args.quic_train_tensor_parallel_size,
         tpu_chip_offset=args.vllm_tensor_parallel_size,
         max_prompt_len=args.max_prompt_len, kl_coef=0.0, lr=1e-6,
+        # Matches jaygala24/Qwen3-1.7B-GRPO-math-reasoning's model card exactly.
+        grad_clip=0.3, weight_decay=0.01,
     )
     reward = MathVerifierReward()
     weight_synchronizer = LocalWeightSynchronizer()
