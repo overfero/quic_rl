@@ -81,6 +81,33 @@ def main() -> None:
 
     from vllm import LLM, SamplingParams
 
+    # tpu_inference's own env_override.py (imported as a side effect of
+    # `import vllm` above) unconditionally force-prepends
+    # `--xla_tpu_use_dynamic_smem_negotiation=true` onto LIBTPU_INIT_ARGS.
+    # Confirmed directly this is a HARD, non-timing-related conflict with
+    # a concurrent torch_xla process sharing this host's TPU: even a
+    # fully deterministic wait for the OTHER process's own "ready" signal
+    # (not just a guessed sleep) didn't help - the shared "local" libtpu
+    # coordination service stays permanently locked to whichever
+    # process's flag set registered first, and any DIFFERENT flag from a
+    # later process is rejected outright
+    # (`ERROR: Unknown command line flag 'xla_tpu_use_dynamic_smem_negotiation'`)
+    # for as long as that first process stays alive - not a race that
+    # more staggering fixes. Stripping this ONE flag here (after
+    # env_override.py's already run, before the engine actually touches
+    # the TPU) is what actually let a concurrent torch_xla process (see
+    # quic_dist's own `tpu_chip_offset`) and this worker coexist -
+    # confirmed directly via a standalone concurrent test with ZERO
+    # stagger. Real cost: this repo doesn't get the SMEM capacity
+    # optimization that flag exists for (see tpu_inference's own
+    # comment: "Remove this when SMEM capacity optimization for batched
+    # rpa lands") - unmeasured but real; not needed for this worker's
+    # own generation-only workload to be correct.
+    os.environ["LIBTPU_INIT_ARGS"] = " ".join(
+        flag for flag in os.environ.get("LIBTPU_INIT_ARGS", "").split()
+        if "xla_tpu_use_dynamic_smem_negotiation" not in flag
+    )
+
     llm = LLM(
         model=model_path, tensor_parallel_size=tensor_parallel_size, max_model_len=max_model_len,
         dtype=dtype,
