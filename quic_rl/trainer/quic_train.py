@@ -80,7 +80,23 @@ class QuicTrainBackend:
     # exactly this during development.
     state_dir: str
 
-    cuda_devices: list[str] | None = None  # one entry per rank; defaults to "0".."world_size-1"
+    cuda_devices: list[str] | None = None  # one entry per rank; defaults to "0".."world_size-1" -
+                                            # ignored on TPU (see initialize_policy(): device
+                                            # selection there goes through quic_dist.training_utils.
+                                            # resolve_device()'s TPU_VISIBLE_CHIPS assignment instead,
+                                            # keyed by tensor_parallel_size below, not this field)
+    # TPU support: quic_dist's rank launcher (grpo_external_rollout_rank.py)
+    # already goes through run_grpo_training_from_rollouts -> _init_rank ->
+    # training_utils.resolve_device(), which is TPU-aware (PJRT_DEVICE=TPU
+    # in this orchestrator's own environment is inherited by every rank
+    # subprocess via `dict(os.environ, ...)` below) - the only piece this
+    # backend needed to add for real TPU use is passing tensor_parallel_size
+    # through into the written GRPOConfig, since real intra-stage tensor
+    # parallelism (see rlhf.RLHFModelConfig.tensor_parallel_size's own
+    # field comment) needs it to shard weights/activations across a rank's
+    # TPU chip block - unset (1) leaves every existing CUDA-based caller of
+    # this class completely unaffected (unchanged default behavior).
+    tensor_parallel_size: int = 1
     # True: genuine full-parameter fine-tuning (no LoRA) - see
     # finetune.PipelineConfig.full_finetune's own docstring for the real
     # mechanics/constraints. Requires quantization="none" and kl_coef=0.0
@@ -154,6 +170,7 @@ class QuicTrainBackend:
             "lora_target_modules": self.lora_target_modules,
             "quantization": self.quantization,
             "compute_dtype": self.compute_dtype,
+            "tensor_parallel_size": self.tensor_parallel_size,
             "max_prompt_len": self.max_prompt_len,
             "kl_coef": self.kl_coef,
             "lr": self.lr,
@@ -172,10 +189,17 @@ class QuicTrainBackend:
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
 
+        is_tpu = os.environ.get("PJRT_DEVICE", "").upper() == "TPU"
         devices = self.cuda_devices or [str(i) for i in range(self.world_size)]
         script = os.path.join(self.quic_dist_repo_dir, "examples", "grpo_external_rollout_rank.py")
         for rank in range(self.world_size):
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES=devices[rank])
+            # TPU: leave device selection to resolve_device()'s own
+            # TPU_VISIBLE_CHIPS logic (keyed by rank + tensor_parallel_size,
+            # inside the rank subprocess itself) - setting CUDA_VISIBLE_DEVICES
+            # here would be meaningless (no CUDA present) and PJRT_DEVICE=TPU
+            # is already inherited from this orchestrator's own environment
+            # via the plain `dict(os.environ)` copy below.
+            env = dict(os.environ) if is_tpu else dict(os.environ, CUDA_VISIBLE_DEVICES=devices[rank])
             log_f = open(os.path.join(self.state_dir, f"quic_train_rank{rank}.log"), "w")
             proc = subprocess.Popen(
                 ["python3", "-u", script, self._config_path, str(rank), self.signaling_url,
