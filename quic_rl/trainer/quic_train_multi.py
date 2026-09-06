@@ -55,6 +55,12 @@ class TrainerMachine:
     host: str = "127.0.0.1"
     ssh_port: int = 22
     ssh_password: str | None = None  # None => this is the local machine, no SSH
+    # Alternative to ssh_password: a plain `~/.ssh/config` Host alias
+    # (key-based auth, e.g. this project's own "Kaggle_Zrok2"/"Kaggle_Zrok3"
+    # zrok-tunnel aliases) - `ssh <alias> <cmd>` / `scp <path> <alias>:<path>`
+    # directly, no sshpass/port/root@127.0.0.1 plumbing needed. Takes
+    # priority over ssh_password when both are set (shouldn't be).
+    ssh_alias: str | None = None
     cuda_devices: list[str] = field(default_factory=lambda: ["0"])  # local GPU indices THIS machine contributes
     quic_dist_repo_dir: str = "/kaggle/working/quic_dist"  # path ON this machine
     state_dir: str = "/data/quic_train_state"  # path ON this machine - see QuicTrainBackend's own
@@ -78,6 +84,23 @@ class SshMultiMachineTrainBackend:
     max_prompt_len: int = 512
     kl_coef: float = 0.05
     lr: float = 1e-4
+    grad_clip: float = 0.0
+    weight_decay: float = 0.0
+    # True: every machine runs on TPU (PJRT_DEVICE=TPU set in the remote
+    # launch env INSTEAD of CUDA_VISIBLE_DEVICES, which is meaningless on
+    # TPU - matches QuicTrainBackend's own single-machine TPU handling).
+    # Real use case this was added for: a genuinely separate GPU machine
+    # runs vLLM-TPU's... no, runs vanilla vLLM for rollout generation
+    # (GpuVLLMRollout, a different machine entirely, not one of these
+    # `machines`), freeing this backend's own single TPU machine to use
+    # its FULL chip count for training - see tensor_parallel_size below.
+    tpu: bool = False
+    # Real intra-rank tensor parallelism via torch_xla SPMD - see
+    # quic_dist.training_utils.resolve_device's own docstring. Meaningful
+    # only when tpu=True; each machine's own rank(s) each get this many
+    # chips (see QuicTrainBackend.tensor_parallel_size's identical field
+    # for the single-machine case this mirrors).
+    tensor_parallel_size: int = 1
     gradient_accumulation_steps: int = 1
     job_id: str = "quic_rl_grpo_multi"
     step_result_timeout_s: float = 600.0
@@ -95,9 +118,13 @@ class SshMultiMachineTrainBackend:
     _rank_local_gpu: list[str] = field(default_factory=list, init=False, repr=False)  # index = global rank
     _local_scratch: str = field(default="", init=False, repr=False)
 
-    # ---- SSH plumbing - same pattern as rollout/ssh_launcher.py's RemoteMachine/_ssh_prefix ----
+    # ---- SSH plumbing - same pattern as rollout/ssh_launcher.py's RemoteMachine/_ssh_prefix,
+    # extended with a plain ssh_alias path (key-based auth via ~/.ssh/config) alongside the
+    # original sshpass/port one - see TrainerMachine.ssh_alias's own docstring for why.
 
     def _ssh_prefix(self, m: TrainerMachine) -> list[str]:
+        if m.ssh_alias is not None:
+            return ["ssh", m.ssh_alias]
         if m.ssh_password is None:
             return []
         return [
@@ -105,6 +132,9 @@ class SshMultiMachineTrainBackend:
             "ssh", "-o", "StrictHostKeyChecking=no", "-p", str(m.ssh_port),
             "root@127.0.0.1",
         ]
+
+    def _is_remote(self, m: TrainerMachine) -> bool:
+        return m.ssh_alias is not None or m.ssh_password is not None
 
     def _retry_transient(self, fn, *, attempts: int = 3, backoff_s: float = 2.0):
         """This project has hit real, repeated transient SSH failures all
@@ -132,7 +162,7 @@ class SshMultiMachineTrainBackend:
 
     def _run_ssh(self, m: TrainerMachine, remote_cmd: str, timeout: float = 30.0) -> str:
         def _do():
-            if m.ssh_password is None:
+            if not self._is_remote(m):
                 return subprocess.run(["bash", "-c", remote_cmd], timeout=timeout, capture_output=True, text=True)
             return subprocess.run(self._ssh_prefix(m) + [remote_cmd], timeout=timeout, capture_output=True, text=True)
 
@@ -155,7 +185,7 @@ class SshMultiMachineTrainBackend:
         # step_result_poll_interval_s.
         try:
             proc = subprocess.run(
-                self._ssh_prefix(m) + [f"test -e {remote_path}"] if m.ssh_password else ["test", "-e", remote_path],
+                self._ssh_prefix(m) + [f"test -e {remote_path}"] if self._is_remote(m) else ["test", "-e", remote_path],
                 timeout=20,
             )
             return proc.returncode == 0
@@ -163,6 +193,11 @@ class SshMultiMachineTrainBackend:
             return False
 
     def _scp_to_machine(self, m: TrainerMachine, local_path: str, remote_path: str, timeout: float = 120.0) -> None:
+        if m.ssh_alias is not None:
+            self._retry_transient(lambda: subprocess.run(
+                ["scp", local_path, f"{m.ssh_alias}:{remote_path}"], timeout=timeout, check=True,
+            ))
+            return
         if m.ssh_password is None:
             import shutil
 
@@ -175,6 +210,11 @@ class SshMultiMachineTrainBackend:
         ))
 
     def _scp_from_machine(self, m: TrainerMachine, remote_path: str, local_path: str, timeout: float = 120.0) -> None:
+        if m.ssh_alias is not None:
+            self._retry_transient(lambda: subprocess.run(
+                ["scp", f"{m.ssh_alias}:{remote_path}", local_path], timeout=timeout, check=True,
+            ))
+            return
         if m.ssh_password is None:
             import shutil
 
@@ -252,6 +292,9 @@ class SshMultiMachineTrainBackend:
                 "max_prompt_len": self.max_prompt_len,
                 "kl_coef": self.kl_coef,
                 "lr": self.lr,
+                "grad_clip": self.grad_clip,
+                "weight_decay": self.weight_decay,
+                "tensor_parallel_size": self.tensor_parallel_size,
                 "gradient_accumulation_steps": self.gradient_accumulation_steps,
                 "checkpoint_dir": self._checkpoint_dir(m),
                 "checkpoint_every": 1,
@@ -284,8 +327,16 @@ class SshMultiMachineTrainBackend:
             script = os.path.join(m.quic_dist_repo_dir, "examples", "grpo_external_rollout_rank.py")
             cfg_path = os.path.join(m.state_dir, "grpo_config.yaml")
             log_path = os.path.join(m.state_dir, f"quic_train_rank{rank}.log")
+            # TPU: leave device selection to resolve_device()'s own
+            # TPU_VISIBLE_CHIPS logic inside the rank subprocess itself -
+            # CUDA_VISIBLE_DEVICES would be meaningless (no CUDA present)
+            # and this repo's remote shells already default PJRT_DEVICE=TPU
+            # (see QuicTrainBackend's identical comment for the
+            # single-machine case) - setting it explicitly here too since
+            # a bare `ssh <alias> <cmd>` shell may not always inherit it.
+            env_prefix = "PJRT_DEVICE=TPU" if self.tpu else f"CUDA_VISIBLE_DEVICES={gpu}"
             cmd = (
-                f"{{ cd {m.quic_dist_repo_dir} && CUDA_VISIBLE_DEVICES={gpu} QUIC_DIST_FAULTHANDLER=1 nohup python3 -u {script} "
+                f"{{ cd {m.quic_dist_repo_dir} && {env_prefix} QUIC_DIST_FAULTHANDLER=1 nohup python3 -u {script} "
                 f"{cfg_path} {rank} {self.signaling_url} {self._rollout_dir(m)} {self.job_id}; }} "
                 f"< /dev/null > {log_path} 2>&1 & disown; echo LAUNCHED"
             )
@@ -477,6 +528,21 @@ class SshMultiMachineTrainBackend:
                 f"{self.step_result_timeout_s}s - check quic_train_rank0.log on {primary.name}"
             )
 
+        # The actual adapter/model weight files exist on `primary`'s OWN
+        # disk at `output_dir` (rank 0's save_pretrained() wrote them
+        # there) - deliberately NOT pulled back to this orchestrator's
+        # local disk: `QuicWeightSynchronizer` (the real weight-transfer
+        # path this backend is meant to pair with) sends DIRECTLY from
+        # `primary` to the rollout machine over real P2P QUIC (see
+        # quic_transfer.py's own docstring for why - full checkpoints can
+        # be multi-GB, and relaying that through this orchestrator's own
+        # (comparatively low-bandwidth) link would be exactly the
+        # "double-hop over a slow relay" this project moved away from).
+        # `self._tokenizer.save_pretrained(output_dir)` still writes
+        # tokenizer files locally, on this SAME `output_dir` string, for
+        # whatever local-only bookkeeping wants them (e.g.
+        # PolicyRegistry) - the model weights themselves are simply never
+        # present here, by design.
         self._tokenizer.save_pretrained(output_dir)
         return output_dir
 
@@ -507,7 +573,7 @@ class SshMultiMachineTrainBackend:
         for rank, m in enumerate(self._rank_machine):
             proc_check = subprocess.run(
                 self._ssh_prefix(m) + [f"pgrep -f 'grpo_external_rollout_rank.py.*{self.job_id}'"]
-                if m.ssh_password else ["pgrep", "-f", f"grpo_external_rollout_rank.py.*{self.job_id}"],
+                if self._is_remote(m) else ["pgrep", "-f", f"grpo_external_rollout_rank.py.*{self.job_id}"],
                 timeout=15,
             )
             if proc_check.returncode != 0:

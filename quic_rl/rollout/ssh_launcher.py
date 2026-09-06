@@ -36,6 +36,11 @@ class RemoteMachine:
     host: str = "127.0.0.1"
     ssh_port: int = 22
     ssh_password: str | None = None  # None => this is the LOCAL machine, no SSH
+    # Alternative to ssh_password: a plain `~/.ssh/config` Host alias
+    # (key-based auth) - see trainer/quic_train_multi.py's
+    # TrainerMachine.ssh_alias for the identical pattern. Takes priority
+    # over ssh_password when both are set (shouldn't be).
+    ssh_alias: str | None = None
     cuda_device: str = "0"
 
 

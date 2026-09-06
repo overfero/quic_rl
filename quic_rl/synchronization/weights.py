@@ -94,7 +94,11 @@ class QuicWeightSynchronizer:
     poll_interval_s: float = 2.0
 
     def _ssh_prefix(self, machine) -> list[str]:
-        if machine is None or machine.ssh_password is None:
+        if machine is None:
+            return []
+        if getattr(machine, "ssh_alias", None) is not None:
+            return ["ssh", machine.ssh_alias]
+        if machine.ssh_password is None:
             return []
         return [
             "sshpass", "-p", machine.ssh_password,
