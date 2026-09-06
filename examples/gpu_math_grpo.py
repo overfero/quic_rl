@@ -235,6 +235,26 @@ def main() -> None:
         )
         real_stage_launcher.restart(bootstrap_dir)
 
+        # restart() only launches the process and returns (see
+        # StageLauncher's own Protocol docstring: "NOT necessarily once
+        # the driver's HTTP API is healthy yet") - real model load +
+        # compilation on the GPU machine takes real time (minutes, not
+        # the ~2s restart() itself sleeps for the port-forward to
+        # establish). QuicVLLMRollout.load_policy() polls this for every
+        # LATER policy update; this bootstrap call bypassed that (calling
+        # the launcher directly, not through load_policy()), so it needs
+        # its own explicit wait here - confirmed directly: without this,
+        # the very first generate() call hits a real Connection Refused
+        # / timeout because nothing is listening on driver_port yet.
+        bootstrap_deadline = time.monotonic() + real_stage_launcher.transport_connect_timeout + 300.0
+        while not rollout.health_check():
+            if time.monotonic() > bootstrap_deadline:
+                raise RuntimeError(
+                    "gpu_math_grpo.py: the bootstrap vLLM fork server never became healthy - "
+                    f"check {args.gpu_work_dir}/quic_rl_stage_gpu.log on {args.gpu_ssh_alias}"
+                )
+            time.sleep(5.0)
+
         initial_version = lifecycle.initialize(rollout, trainer, initial_policy_path=args.model_path)
 
         from transformers import AutoTokenizer
