@@ -211,6 +211,13 @@ def main() -> None:
         driver_url=real_stage_launcher.driver_url(),
         stage_launcher=NoOpStageLauncher(),  # the REAL restart already happens inside QuicWeightSynchronizer.sync()
         model_name=args.model_path,
+        # QuicVLLMRollout's own 120s default is nowhere near enough for a
+        # real request here: group_size x max_new_tokens completions in
+        # ONE /v1/completions call (e.g. 16 x 2048 tokens), PLUS the
+        # custom fork's own first-request compile/warmup cost on a
+        # single T4 - confirmed directly: the first real generate() call
+        # timed out at 120s with no result at all.
+        request_timeout=1800.0,
     )
 
     try:
