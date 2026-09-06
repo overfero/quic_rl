@@ -97,6 +97,14 @@ class QuicTrainBackend:
     # TPU chip block - unset (1) leaves every existing CUDA-based caller of
     # this class completely unaffected (unchanged default behavior).
     tensor_parallel_size: int = 1
+    # Shifts quic-train's own TPU chip block by this many chips - see
+    # quic_dist.training_utils.resolve_device()'s chip_offset docstring.
+    # Real use case: LocalVLLMRollout pinned to chips [0, k) via its own
+    # env-var chip restriction, this backend's rank(s) confined to the
+    # remaining [k, total) - confirmed directly that a torch_xla process
+    # and a concurrent JAX process can each claim their own disjoint
+    # chip rectangle this way. 0 (default) = unchanged behavior.
+    tpu_chip_offset: int = 0
     # True: genuine full-parameter fine-tuning (no LoRA) - see
     # finetune.PipelineConfig.full_finetune's own docstring for the real
     # mechanics/constraints. Requires quantization="none" and kl_coef=0.0
@@ -171,6 +179,7 @@ class QuicTrainBackend:
             "quantization": self.quantization,
             "compute_dtype": self.compute_dtype,
             "tensor_parallel_size": self.tensor_parallel_size,
+            "tpu_chip_offset": self.tpu_chip_offset,
             "max_prompt_len": self.max_prompt_len,
             "kl_coef": self.kl_coef,
             "lr": self.lr,

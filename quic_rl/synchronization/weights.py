@@ -209,6 +209,45 @@ class QuicWeightSynchronizer:
             time.sleep(self.poll_interval_s)
 
 
+@dataclass
+class LocalWeightSynchronizer:
+    """Real `WeightSynchronizer` for the same-host topology
+    `LocalVLLMRollout` is built for (quic_dist/examples/vllm_generate_rollout.py's
+    module docstring; see `LocalVLLMRollout`'s own docstring for why this
+    project's actual first topology - one shared Kaggle TPU VM - doesn't
+    need cross-machine transfer at all). `TrainerBackend.export_policy()`
+    already writes the LoRA adapter directly to `policy_dir` on the ONE
+    filesystem both the trainer and rollout backend share - there is
+    nothing to send anywhere. `sync()` measures the real exported size
+    (for honest metrics - the prompt's own instruction not to hide sync
+    cost fields, even when that cost is genuinely ~0) and returns
+    immediately; `Controller._sync_policy()` calls
+    `rollout.load_policy(exported_path, new_version)` right after this
+    returns regardless of synchronizer, which is the actual "make the
+    rollout backend serve the new version" step here (a real LoRA
+    hot-swap - see `LocalVLLMRollout.load_policy()` - not a network
+    operation this class could meaningfully do part of)."""
+
+    def _dir_size_bytes(self, path: str) -> int:
+        import os
+
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                total += os.path.getsize(os.path.join(root, name))
+        return total
+
+    def sync(self, policy_dir: str, policy_version: int) -> SyncResult:
+        t0 = time.monotonic()
+        size = self._dir_size_bytes(policy_dir)
+        sync_time_s = time.monotonic() - t0
+        return SyncResult(
+            policy_version=policy_version, weight_size_bytes=size,
+            transfer_time_s=0.0, sync_time_s=sync_time_s, reload_time_s=0.0,
+            total_overhead_s=sync_time_s,
+        )
+
+
 class MockWeightSynchronizer:
     """GPU/network-free stand-in - simulates the sync steps' ORDER and
     timing structure without any real transfer, so orchestrator tests
