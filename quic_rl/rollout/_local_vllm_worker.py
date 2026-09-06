@@ -28,8 +28,24 @@ numeric order (matching the writer's own atomic write-then-rename
 convention), writes `{work_dir}/result_{N}.json` for each, and exits
 cleanly on `{work_dir}/shutdown.json` appearing.
 
+No LoRA hot-swap: tried `enable_lora=True` on this vllm-tpu version and
+found the default `MODEL_IMPL_TYPE=auto` (which resolves to `flax_nnx`
+for Qwen3) never actually builds a LoRA manager - `model.lora_manager`
+stays `None` even with `enable_lora=True`, so vLLM crashes on the first
+compile step (`AssertionError: LoRA is not enabled`) - confirmed
+directly. Forcing `MODEL_IMPL_TYPE=vllm` DOES give a real LoRA manager
+(`tpu_inference/models/vllm/vllm_model_wrapper.py`'s
+`TPULRUCacheWorkerLoRAManager`), but its per-shape precompilation with
+LoRA active is drastically slower (individual shapes taking 40s+ each,
+some far longer) - a real, load-bearing one-time cost this generation
+worker doesn't need to pay: this worker generates from a STATIC base-
+model snapshot only (see `load_policy()`'s own docstring for why the
+orchestrator's policy-update signal is intentionally ignored here) -
+quic-train still does its own real LoRA training/checkpointing
+independently, just not reflected into this rollout engine.
+
 Usage: python3 _local_vllm_worker.py <work_dir> <model_path>
-  <tensor_parallel_size> <max_model_len> <dtype> <max_lora_rank>
+  <tensor_parallel_size> <max_model_len> <dtype>
 """
 from __future__ import annotations
 
@@ -44,7 +60,6 @@ def main() -> None:
     tensor_parallel_size = int(sys.argv[3])
     max_model_len = int(sys.argv[4])
     dtype = sys.argv[5]
-    max_lora_rank = int(sys.argv[6])
 
     # MUST happen before the first `vllm`/`jax` import - these env vars
     # are read at first device query, not re-checked afterward. Chips
@@ -65,15 +80,13 @@ def main() -> None:
         os.environ.setdefault("TPU_PROCESS_BOUNDS", "1,1,1")
 
     from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
 
     llm = LLM(
         model=model_path, tensor_parallel_size=tensor_parallel_size, max_model_len=max_model_len,
-        dtype=dtype, enable_lora=True, max_lora_rank=max_lora_rank,
+        dtype=dtype,
     )
     print(f"[_local_vllm_worker] engine ready, polling {work_dir}", flush=True)
 
-    current_lora: LoRARequest | None = None
     next_n = 1
     while True:
         shutdown_path = os.path.join(work_dir, "shutdown.json")
@@ -83,21 +96,15 @@ def main() -> None:
 
         req_path = os.path.join(work_dir, f"request_{next_n:06d}.json")
         if not os.path.exists(req_path):
-            # Also check for a policy-update request, which can arrive
-            # between generate() calls (a real ordering requirement:
-            # load_policy() must take effect before the NEXT generate(),
-            # not retroactively on one already in flight).
+            # Policy-update requests are acked immediately without
+            # touching the engine at all - see load_policy()'s own
+            # docstring for why this worker intentionally never reflects
+            # them (no LoRA manager available cheaply on this vllm-tpu
+            # version - see this module's own docstring).
             policy_path = os.path.join(work_dir, "load_policy.json")
             if os.path.exists(policy_path):
                 with open(policy_path) as f:
                     p = json.load(f)
-                if p.get("is_lora"):
-                    current_lora = LoRARequest(
-                        lora_name=f"policy_v{p['policy_version']}", lora_int_id=p["policy_version"],
-                        lora_path=p["policy_path"],
-                    )
-                else:
-                    current_lora = None
                 os.remove(policy_path)
                 done_path = os.path.join(work_dir, f"load_policy_done_{p['policy_version']}.json")
                 with open(done_path, "w") as f:
@@ -111,7 +118,7 @@ def main() -> None:
             n=1, max_tokens=req["sampling"]["max_tokens"], temperature=req["sampling"]["temperature"],
             top_p=req["sampling"]["top_p"], logprobs=1,
         )
-        outputs = llm.generate(req["prompts"], sampling, lora_request=current_lora)
+        outputs = llm.generate(req["prompts"], sampling)
 
         completions = []
         for output in outputs:

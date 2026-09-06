@@ -38,14 +38,21 @@ real filesystem (same host) and this project's own quic-dist rank
 processes use the identical atomic write-then-rename convention
 (`grpo_external_rollout_rank.py`) - one polling protocol, not two.
 
-LoRA support (`enable_lora=True` + a `LoRARequest` the worker rebuilds
-whenever `load_policy.json` names a NEW policy version) stays real and
-load-bearing: quic-train's real training here is LoRA
-(`quic_dist.finetune.PipelineConfig`/`rlhf.GRPOConfig`'s default
-`full_finetune=False`), so `policy_path` is normally the adapter
-directory peft's own `save_pretrained()` writes (a few MB) - the
-resident engine only needs to swap the small adapter, never reload the
-base model weights."""
+No LoRA hot-swap: tried `enable_lora=True` against this vllm-tpu
+version and found its default model-impl path (`flax_nnx`, what Qwen3
+resolves to) never actually builds a LoRA manager - confirmed directly
+(`AssertionError: LoRA is not enabled` on the very first compile step,
+`model.lora_manager` stays `None` regardless of `enable_lora=True`).
+Forcing `MODEL_IMPL_TYPE=vllm` does give a real LoRA manager, but its
+per-shape precompilation with LoRA active is drastically slower (many
+individual shapes taking 40s+, some far longer) - a real, load-bearing
+one-time cost not worth paying here: `load_policy()` records
+`policy_path`/`policy_version` for bookkeeping/metadata only and is
+intentionally NEVER pushed into the resident worker (see its own
+docstring) - this rollout always generates from the SAME base-model
+snapshot the worker booted with. quic-train still does its own real
+LoRA training/checkpointing on the other chip block, completely
+unaffected by this."""
 from __future__ import annotations
 
 import json
@@ -69,7 +76,6 @@ class LocalVLLMRollout:
     tensor_parallel_size: int = 2  # chips [0, tensor_parallel_size) - see module docstring
     max_model_len: int = 4096
     dtype: str = "bfloat16"
-    max_lora_rank: int = 8
     generate_timeout_s: float = 1800.0
     startup_timeout_s: float = 600.0  # real first-boot cost (~99s measured on Qwen3-1.7B) plus margin
     hf_home: str | None = None  # HF_HOME to export into the worker's env - keeps the model
@@ -96,7 +102,7 @@ class LocalVLLMRollout:
             env["HF_HOME"] = self.hf_home
         self._proc = subprocess.Popen(
             [self.vllm_venv_python, "-u", worker, self.work_dir, self.model_path,
-             str(self.tensor_parallel_size), str(self.max_model_len), self.dtype, str(self.max_lora_rank)],
+             str(self.tensor_parallel_size), str(self.max_model_len), self.dtype],
             env=env,
         )
         self._next_n = 1
@@ -111,14 +117,17 @@ class LocalVLLMRollout:
                 raise RuntimeError(f"LocalVLLMRollout worker exited during startup (returncode={self._proc.returncode})")
             return
 
-    def _push_policy_if_changed(self, is_lora: bool) -> None:
+    def _push_policy_if_changed(self) -> None:
+        """Acks the current policy version to the worker (bookkeeping
+        only - the worker never actually reloads weights for it, see
+        this module's own docstring for why)."""
         if self._loaded_version_on_worker == self._policy_version:
             return
         policy_path = os.path.join(self.work_dir, "load_policy.json")
         done_path = os.path.join(self.work_dir, f"load_policy_done_{self._policy_version}.json")
         tmp_path = policy_path + ".tmp"
         with open(tmp_path, "w") as f:
-            json.dump({"is_lora": is_lora, "policy_path": self._policy_path, "policy_version": self._policy_version}, f)
+            json.dump({"policy_path": self._policy_path, "policy_version": self._policy_version}, f)
         os.rename(tmp_path, policy_path)
 
         deadline = time.monotonic() + self.generate_timeout_s
@@ -132,16 +141,14 @@ class LocalVLLMRollout:
         self._loaded_version_on_worker = self._policy_version
 
     def load_policy(self, policy_path: str, policy_version: int) -> None:
-        """Records `policy_path`/`policy_version`; the actual hot-swap on
-        the resident worker happens lazily on the next `generate()` call
-        (`_push_policy_if_changed`), since the worker may not be started
-        yet the first time this is called (`orchestrator/lifecycle.py`'s
-        `initialize()` calls this BEFORE the first `generate()`).
-
-        `policy_path`: either a peft LoRA adapter directory (every real
-        training update) OR the base model path itself (no adapter yet
-        at `initialize()` time). Detected by the real, load-bearing
-        `adapter_config.json` peft always writes."""
+        """Records `policy_path`/`policy_version` for `get_status()`/
+        `Trajectory.policy_version` bookkeeping only - this rollout's
+        resident worker NEVER actually reloads weights for it (see this
+        module's own docstring for why: no cheap LoRA hot-swap path on
+        this vllm-tpu version, and this backend generates from a single
+        static base-model snapshot for the whole run). Real per-step
+        policy updates come from quic-train's own training/checkpointing
+        on its own disjoint chip block, independent of this rollout."""
         self._policy_path = policy_path
         self._policy_version = policy_version
 
@@ -150,8 +157,7 @@ class LocalVLLMRollout:
             raise RuntimeError("LocalVLLMRollout.generate() called before load_policy()")
 
         self._ensure_started()
-        is_lora = os.path.exists(os.path.join(self._policy_path, "adapter_config.json"))
-        self._push_policy_if_changed(is_lora)
+        self._push_policy_if_changed()
 
         prompts: list[str] = []
         owners: list[GenerationRequest] = []
