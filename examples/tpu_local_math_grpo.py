@@ -51,56 +51,23 @@ import sys
 import time
 from pathlib import Path
 
-# MUST happen before QuicTrainBackend/LocalVLLMRollout spawn their rank/
-# worker subprocesses (both inherit this via plain `dict(os.environ)`
-# copies) - real crash found running this for real: torch_xla and
-# vLLM-TPU's tpu_inference backend each set their OWN default
-# LIBTPU_INIT_ARGS (torch_xla's own __init__.py; tpu_inference's
-# env_override.py unconditionally prepends
-# `--xla_tpu_use_dynamic_smem_negotiation=true`) - whichever process's
-# subprocess touches the TPU FIRST registers its flags with this host's
-# shared libtpu runtime coordination service (the "SliceBuilder" service
-# named in that service's own warning), and the OTHER process's later,
-# DIFFERING flag set gets rejected outright
-# (`ERROR: Unknown command line flag 'xla_tpu_use_dynamic_smem_negotiation'`,
-# confirmed directly - this is a HOST-level init race, not a per-process
-# one, unlike TPU_VISIBLE_CHIPS/TPU_CHIPS_PER_PROCESS_BOUNDS which really
-# are per-process). Pre-setting the flag tpu_inference wants here means
-# torch_xla's own `_set_missing_flags()` (additive, never overwrites an
-# existing flag) just adds its usual defaults on top instead of leaving
-# it unset - both processes end up agreeing on it regardless of launch
-# order.
-#
-# Pre-setting ONLY tpu_inference's flag turned out not to be enough -
-# confirmed directly via a standalone concurrent-race test: torch_xla's
-# OWN `_setup_libtpu_flags()` (torch_xla/__init__.py) then ADDS SIX more
-# of ITS OWN default flags on top (additive, `_set_missing_flags`,
-# real ones - see that function's own comments for why each exists:
-# `xla_tpu_use_enhanced_launch_barrier=false`, `xla_latency_hiding_
-# scheduler_rerun=1`, `xla_tpu_prefer_async_allgather_to_allreduce=true`,
-# `xla_tpu_enable_flash_attention=false`,
-# `xla_enable_async_all_gather=true`,
-# `xla_enable_async_collective_permute=true` on v5), while tpu_inference
-# only duplicates its own single flag - so the two processes' FINAL
-# strings still didn't match, and whichever one's subprocess reached
-# this host's shared libtpu runtime coordination service SECOND still
-# got rejected (confirmed: it happened to torch_xla's side that time,
-# not vLLM's - a true race, not one side being "wrong"). Pre-baking
-# torch_xla's own complete default set here means its own
-# `_set_missing_flags()` finds everything already present by name and
-# adds nothing further, so both processes' final strings end up
-# byte-identical (mod tpu_inference's harmless exact-duplicate prepend).
-os.environ.setdefault(
-    "LIBTPU_INIT_ARGS",
-    "--xla_tpu_use_dynamic_smem_negotiation=true "
-    "--xla_tpu_use_enhanced_launch_barrier=false "
-    "--xla_latency_hiding_scheduler_rerun=1 "
-    "--xla_tpu_prefer_async_allgather_to_allreduce=true "
-    "--xla_tpu_enable_flash_attention=false "
-    "--xla_enable_async_all_gather=true "
-    "--xla_enable_async_collective_permute=true",
-)
-
+# Deliberately does NOT set LIBTPU_INIT_ARGS here - tried that (both
+# tpu_inference's single flag alone, and a hand-merged string containing
+# every flag both sides' own init code would otherwise add on their own)
+# and made things WORSE: injecting `--xla_tpu_use_dynamic_smem_negotiation
+# =true` into the ORCHESTRATOR's env means BOTH children inherit it via
+# their own plain `dict(os.environ)` copies, including quic-train's rank
+# subprocess - and confirmed directly that torch_xla crashes on THIS
+# flag specifically whenever it isn't the process that ends up "owning"
+# this host's shared libtpu runtime coordination service (the
+# "SliceBuilder" service named in that service's own warning) - i.e. the
+# flag itself isn't safe to force onto torch_xla at all, matching or not.
+# Every test that actually WORKED (see `_local_vllm_worker.py`'s own
+# docstring and this repo's own validation history) left LIBTPU_INIT_ARGS
+# completely untouched and let each side's own library compute its own
+# natural defaults (torch_xla's `_setup_libtpu_flags()`; tpu_inference's
+# `env_override.py`) - the ACTUAL fix is `--tpu-init-stagger-s` below,
+# not this flag.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from quic_rl.dataset.math_dataset import build_prompt_source
