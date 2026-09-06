@@ -49,6 +49,15 @@ class SshMultiMachineStageLauncher:
     vllm_repo_dir: str
     machines: list[RemoteMachine]  # ordered rank0..rankN-1; last is the driver
     signaling_url: str
+    # setup_inference_machine.sh's own default build venv - a real,
+    # necessary override: this fork's own README documents that it
+    # builds vllm into an ISOLATED venv (kept off the main environment's
+    # torch, which quic-train/quic-rl use a different version of), and
+    # explicitly warns any script that needs vllm must run with THIS
+    # venv's python3, never bare `python3` - see that script's own
+    # comment for why (real vllm/torch version conflict, not a style
+    # preference).
+    vllm_venv_python: str = "/vllm_build_venv/bin/python3"
     max_model_len: int = 2048
     max_num_seqs: int = 4
     gpu_memory_utilization: float = 0.5
@@ -63,6 +72,8 @@ class SshMultiMachineStageLauncher:
     _port_forward: subprocess.Popen | None = field(default=None, init=False, repr=False)
 
     def _ssh_prefix(self, m: RemoteMachine) -> list[str]:
+        if m.ssh_alias is not None:
+            return ["ssh", m.ssh_alias]
         if m.ssh_password is None:
             return []
         return [
@@ -70,6 +81,9 @@ class SshMultiMachineStageLauncher:
             "ssh", "-o", "StrictHostKeyChecking=no", "-p", str(m.ssh_port),
             "root@127.0.0.1",
         ]
+
+    def _is_remote(self, m: RemoteMachine) -> bool:
+        return m.ssh_alias is not None or m.ssh_password is not None
 
     def _env_prefix(self, m: RemoteMachine) -> str:
         return (
@@ -86,13 +100,12 @@ class SshMultiMachineStageLauncher:
                 self._port_forward.kill()
             self._port_forward = None
         for m in self.machines:
-            log_hint = f"{self.remote_log_dir}/quic_rl_stage_{m.name}.log"
             kill_cmd = (
                 "pkill -9 -f 'scripts/stage_server.py' 2>/dev/null; "
                 "pkill -9 -f 'vllm.entrypoints.cli.main' 2>/dev/null; "
                 "true"
             )
-            if m.ssh_password is None:
+            if not self._is_remote(m):
                 subprocess.run(kill_cmd, shell=True)
             else:
                 subprocess.run(
@@ -134,7 +147,7 @@ class SshMultiMachineStageLauncher:
 
             if not is_driver:
                 cmd = (
-                    f"{self._env_prefix(m)} nohup python3 -u "
+                    f"{self._env_prefix(m)} nohup {self.vllm_venv_python} -u "
                     f"{self.vllm_repo_dir}/scripts/stage_server.py "
                     f"--pp-rank {rank} --pp-world-size {n} "
                     f"--self-name {self_name} "
@@ -163,7 +176,7 @@ class SshMultiMachineStageLauncher:
                 # value that broke argparse for exactly this n==1 case.
                 remote_names = ",".join(wire_names[:-1])
                 cmd = (
-                    f"{self._env_prefix(m)} nohup python3 -u "
+                    f"{self._env_prefix(m)} nohup {self.vllm_venv_python} -u "
                     f"{self.vllm_repo_dir}/scripts/launch_pp_stage.py "
                     f"--pp-rank {rank} --pp-world-size {n} "
                     f"--self-name {self_name} "
@@ -180,12 +193,14 @@ class SshMultiMachineStageLauncher:
                 )
 
             log_path = f"{self.remote_log_dir}/quic_rl_stage_{m.name}.log"
-            if m.ssh_password is None:
+            if not self._is_remote(m):
                 full_cmd = f"cd {self.vllm_repo_dir} && {cmd} > {log_path} 2>&1"
                 proc = subprocess.Popen(["bash", "-c", full_cmd])
                 self._procs[m.name] = proc
             else:
-                remote_full_cmd = f"{cmd} > {log_path} 2>&1 & disown; echo LAUNCHED_{m.name}"
+                remote_full_cmd = (
+                    f"{{ cd {self.vllm_repo_dir} && {cmd}; }} < /dev/null > {log_path} 2>&1 & disown; echo LAUNCHED_{m.name}"
+                )
                 subprocess.run(
                     self._ssh_prefix(m) + [remote_full_cmd],
                     timeout=20, check=True,
@@ -195,7 +210,7 @@ class SshMultiMachineStageLauncher:
                 time.sleep(1.0)  # stagger listens-before-connects, matches validated manual runs
 
         driver = self.machines[-1]
-        if driver.ssh_password is not None:
+        if self._is_remote(driver):
             # The driver's HTTP API is only reachable from this orchestrator
             # process through the same SSH tunnel used to manage it - open
             # a local port-forward so QuicVLLMRollout's plain HTTP client
@@ -204,12 +219,15 @@ class SshMultiMachineStageLauncher:
             # locally as remotely (driver_port), so driver_url() is a fixed,
             # known-upfront value - callers (e.g. QuicVLLMRollout) construct
             # it once at __init__ time, before restart() has ever run.
-            fwd_cmd = [
-                "sshpass", "-p", driver.ssh_password,
-                "ssh", "-o", "StrictHostKeyChecking=no", "-N",
-                "-L", f"{self.driver_port}:127.0.0.1:{self.driver_port}",
-                "-p", str(driver.ssh_port), "root@127.0.0.1",
-            ]
+            if driver.ssh_alias is not None:
+                fwd_cmd = ["ssh", "-N", "-L", f"{self.driver_port}:127.0.0.1:{self.driver_port}", driver.ssh_alias]
+            else:
+                fwd_cmd = [
+                    "sshpass", "-p", driver.ssh_password,
+                    "ssh", "-o", "StrictHostKeyChecking=no", "-N",
+                    "-L", f"{self.driver_port}:127.0.0.1:{self.driver_port}",
+                    "-p", str(driver.ssh_port), "root@127.0.0.1",
+                ]
             self._port_forward = subprocess.Popen(fwd_cmd)
             time.sleep(2.0)  # let the forward establish before the first request
 

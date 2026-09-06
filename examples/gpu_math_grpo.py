@@ -1,12 +1,12 @@
 """Real, runnable full orchestrator loop across TWO SEPARATE machines:
 quic-train's own TPU host (full 8 chips, no chip-sharing needed at all -
 see SshMultiMachineTrainBackend's own `tpu`/`tensor_parallel_size`
-fields) for training, and a genuinely separate CUDA GPU box (e.g. a
-2xT4 Kaggle machine) for real vLLM rollout generation - see
-rollout/vllm_serve_launcher.py's own module docstring for why this
-topology replaced the earlier same-host 2+6 TPU chip-split attempt (a
-hard, currently-unresolvable dependency ceiling on that single TPU
-host).
+fields) for training, and a genuinely separate CUDA GPU box (2xT4)
+running this project's OWN custom quic-vllm fork (github.com/overfero/vllm
+- real UDP hole-punch pipeline-parallel transport, NOT vanilla PyPI
+vllm) for rollout generation - see this topology replaced the earlier
+same-host 2+6 TPU chip-split attempt (a hard, currently-unresolvable
+dependency ceiling on that single TPU host).
 
 `full_finetune=True`: confirmed directly against
 jaygala24/Qwen3-1.7B-GRPO-math-reasoning's own model card (the real
@@ -30,12 +30,14 @@ docstring for the deeper rationale.
 This orchestrator process itself runs on NEITHER Kaggle machine - it
 runs wherever it has SSH access (via ~/.ssh/config aliases) to BOTH:
 `SshMultiMachineTrainBackend` launches quic-train's rank subprocess on
-the TPU machine over SSH; `QuicWeightSynchronizer` + `VllmServeStageLauncher`
-relay the real checkpoint P2P and restart vLLM on the GPU machine;
-`QuicVLLMRollout`'s own HTTP generation calls go through a local SSH
-port-forward this script opens itself (small, frequent request/response
-bodies - unlike the checkpoint, cheap enough over the existing SSH
-tunnel).
+the TPU machine over SSH; `QuicWeightSynchronizer` (weight bytes, real
+QUIC P2P) + `ssh_launcher.SshMultiMachineStageLauncher` (server restart,
+the custom vllm fork's OWN `scripts/launch_pp_stage.py --transport quic`
+- a SINGLE stage here, n==1, this model fits on one T4) together make
+the GPU machine serve the new policy; `QuicVLLMRollout`'s own HTTP
+generation calls go through the SshMultiMachineStageLauncher's own local
+SSH port-forward (small, frequent request/response bodies - unlike the
+checkpoint, cheap enough over the existing SSH tunnel).
 
 Run:
   python3 examples/gpu_math_grpo.py \\
@@ -43,6 +45,7 @@ Run:
     --tpu-quic-dist-repo-dir /kaggle/working/quic_dist \\
     --tpu-state-dir /kaggle/working/quic_rl_state \\
     --gpu-ssh-alias Kaggle_Zrok3 \\
+    --gpu-vllm-repo-dir /kaggle/working/vllm \\
     --gpu-work-dir /kaggle/working/gpu_vllm_state \\
     --public-signaling-url https://gj5t9o1guwr2.share.zrok.io \\
     --local-state-dir /tmp/quic_rl_gpu_math_state \\
@@ -64,8 +67,8 @@ from quic_rl.orchestrator.controller import Controller
 from quic_rl.reward.math_verifier import MathVerifierReward
 from quic_rl.rollout.base import SamplingParams
 from quic_rl.rollout.quic_vllm import QuicVLLMRollout
-from quic_rl.rollout.ssh_launcher import RemoteMachine
-from quic_rl.rollout.vllm_serve_launcher import NoOpStageLauncher, VllmServeStageLauncher
+from quic_rl.rollout.ssh_launcher import RemoteMachine, SshMultiMachineStageLauncher
+from quic_rl.rollout.vllm_serve_launcher import NoOpStageLauncher
 from quic_rl.synchronization.weights import QuicWeightSynchronizer
 from quic_rl.trainer.quic_train_multi import SshMultiMachineTrainBackend, TrainerMachine
 
@@ -129,10 +132,11 @@ def main() -> None:
                          "localhost:8000` run on the TPU machine) - required for the cross-machine QUIC weight "
                          "transfer, since the two Kaggle VMs can't reach each other's private tunnels directly")
     p.add_argument("--gpu-ssh-alias", required=True)
+    p.add_argument("--gpu-vllm-repo-dir", required=True, help="this project's own custom quic-vllm fork, path ON THE GPU MACHINE")
+    p.add_argument("--gpu-vllm-venv", default="/vllm_build_venv",
+                    help="setup_inference_machine.sh's own default build venv path ON THE GPU MACHINE")
     p.add_argument("--gpu-work-dir", required=True, help="path ON THE GPU MACHINE")
-    p.add_argument("--gpu-port", type=int, default=8000)
-    p.add_argument("--gpu-tensor-parallel-size", type=int, default=1)
-    p.add_argument("--gpu-dtype", default="float16", help="T4 has no real bfloat16 support - see vllm_serve_launcher.py")
+    p.add_argument("--gpu-driver-port", type=int, default=8080)
     p.add_argument("--local-state-dir", required=True, help="path on THIS orchestrator's own machine")
     p.add_argument("--num-layers", type=int, default=28)
     p.add_argument("--group-size", type=int, default=16, help="matches jaygala24's own GRPO group size")
@@ -185,6 +189,11 @@ def main() -> None:
         # Matches jaygala24/Qwen3-1.7B-GRPO-math-reasoning's model card exactly.
         grad_clip=0.3, weight_decay=0.01,
     )
+    real_stage_launcher = SshMultiMachineStageLauncher(
+        vllm_repo_dir=args.gpu_vllm_repo_dir, machines=[gpu_machine], signaling_url=args.public_signaling_url,
+        max_model_len=args.max_prompt_len + args.max_new_tokens, driver_port=args.gpu_driver_port,
+        remote_log_dir=args.gpu_work_dir,
+    )
     weight_synchronizer = QuicWeightSynchronizer(
         receiver=gpu_machine,
         remote_policy_root=f"{args.gpu_work_dir}/policy_versions",
@@ -192,32 +201,40 @@ def main() -> None:
         remote_quic_dist_repo_dir=f"{args.gpu_work_dir}/../quic_dist",
         local_quic_dist_repo_dir=args.tpu_quic_dist_repo_dir,  # a path ON THE SENDER (tpu_machine) - see class docstring
         signaling_url=args.public_signaling_url,
-        stage_launcher=VllmServeStageLauncher(
-            ssh_alias=args.gpu_ssh_alias, port=args.gpu_port, tensor_parallel_size=args.gpu_tensor_parallel_size,
-            dtype=args.gpu_dtype, max_model_len=args.max_prompt_len + args.max_new_tokens,
-            remote_work_dir=args.gpu_work_dir,
-        ),
+        stage_launcher=real_stage_launcher,
         sender=tpu_machine,
         sender_quic_transfer_script=f"{args.tpu_quic_dist_repo_dir}/../quic_rl/quic_rl/synchronization/quic_transfer.py",
     )
     reward = MathVerifierReward()
 
-    # QuicVLLMRollout's own HTTP /v1/completions calls need a LOCAL port-
-    # forward to the GPU machine - small, frequent request/response
-    # bodies, unlike the checkpoint (which goes over real P2P QUIC
-    # instead - see this file's own module docstring).
-    port_forward = subprocess.Popen(
-        ["ssh", "-N", "-L", f"{args.gpu_port}:127.0.0.1:{args.gpu_port}", args.gpu_ssh_alias],
-    )
-    time.sleep(2.0)
-
     rollout = QuicVLLMRollout(
-        driver_url=f"http://127.0.0.1:{args.gpu_port}",
+        driver_url=real_stage_launcher.driver_url(),
         stage_launcher=NoOpStageLauncher(),  # the REAL restart already happens inside QuicWeightSynchronizer.sync()
         model_name=args.model_path,
     )
 
     try:
+        # Bootstrap: nothing ever calls real_stage_launcher.restart() for
+        # the INITIAL base model otherwise - lifecycle.initialize() only
+        # calls rollout.load_policy() (a no-op here, see NoOpStageLauncher's
+        # own docstring), and QuicWeightSynchronizer.sync() (which drives
+        # the real launcher) only runs from INSIDE the training loop,
+        # after the first real training step. Downloads the base model
+        # into the SAME `{remote_policy_root}/v0/stage0` layout later
+        # checkpoints will use, directly on the GPU machine (its own
+        # transformers/huggingface_hub, exactly like quic-train's own
+        # build_stage_model() resolves an HF repo id - no cross-machine
+        # transfer needed for a public HF model).
+        bootstrap_dir = f"{args.gpu_work_dir}/policy_versions/v0"
+        subprocess.run(
+            ["ssh", args.gpu_ssh_alias,
+             f"mkdir -p {bootstrap_dir}/stage0 && {args.gpu_vllm_venv}/bin/python3 -c "
+             f"\"from huggingface_hub import snapshot_download; "
+             f"snapshot_download('{args.model_path}', local_dir='{bootstrap_dir}/stage0')\""],
+            timeout=1800, check=True,
+        )
+        real_stage_launcher.restart(bootstrap_dir)
+
         initial_version = lifecycle.initialize(rollout, trainer, initial_policy_path=args.model_path)
 
         from transformers import AutoTokenizer
@@ -275,11 +292,7 @@ def main() -> None:
         lifecycle.shutdown(rollout, trainer)
         trainer.shutdown()
     finally:
-        port_forward.terminate()
-        try:
-            port_forward.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            port_forward.kill()
+        real_stage_launcher.shutdown()
 
 
 if __name__ == "__main__":
