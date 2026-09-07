@@ -75,6 +75,22 @@ class SshMultiMachineTrainBackend:
     machines: list[TrainerMachine]  # ordered - machines[0] gets ranks [0, len(cuda_devices)), etc.
     signaling_url: str
     num_layers: int
+    # Where THIS orchestrator process (not any of `machines`) can import
+    # `quic_dist` from - needed for `_rollout_batch_cls()`'s own
+    # RolloutBatch serialization (torch.save()-ing a batch locally before
+    # scp'ing it out). None (default) falls back to
+    # `machines[0].quic_dist_repo_dir` - correct ONLY when the
+    # orchestrator runs ON that same machine (this class's original,
+    # same-host assumption). Confirmed directly this default is WRONG
+    # for the real cross-machine topology (examples/gpu_math_grpo.py):
+    # `machines[0].quic_dist_repo_dir` is a REMOTE path
+    # (`/kaggle/working/quic_dist`), and inserting its dirname into
+    # THIS process's own sys.path is meaningless - `ModuleNotFoundError:
+    # No module named 'quic_dist'` every time. Set this to the parent
+    # directory of a LOCAL quic_dist checkout (this orchestrator's own
+    # machine needs one, rust extension built, purely for the
+    # RolloutBatch dataclass import - no TPU/GPU use).
+    local_quic_dist_parent_dir: str | None = None
     full_finetune: bool = False
     lora_r: int = 8
     lora_alpha: int = 16
@@ -240,8 +256,11 @@ class SshMultiMachineTrainBackend:
             # standing convention for how these repos get onto a fresh
             # machine). Only used locally, for torch.save()-ing a real
             # RolloutBatch instance before it gets scp'd out.
-            local_quic_dist = self.machines[0].quic_dist_repo_dir
-            parent = os.path.dirname(os.path.abspath(local_quic_dist))
+            if self.local_quic_dist_parent_dir is not None:
+                parent = os.path.abspath(self.local_quic_dist_parent_dir)
+            else:
+                local_quic_dist = self.machines[0].quic_dist_repo_dir
+                parent = os.path.dirname(os.path.abspath(local_quic_dist))
             if parent not in sys.path:
                 sys.path.insert(0, parent)
             from quic_dist.rlhf import RolloutBatch

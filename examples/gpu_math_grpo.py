@@ -188,6 +188,11 @@ def main() -> None:
         max_prompt_len=args.max_prompt_len, kl_coef=0.0, lr=1e-6,
         # Matches jaygala24/Qwen3-1.7B-GRPO-math-reasoning's model card exactly.
         grad_clip=0.3, weight_decay=0.01,
+        # This orchestrator's own machine needs a LOCAL quic_dist checkout
+        # (rust extension built, no TPU/GPU use - purely the RolloutBatch
+        # dataclass import) - see SshMultiMachineTrainBackend's own field
+        # docstring for why the remote-path default is wrong here.
+        local_quic_dist_parent_dir=str(Path(__file__).resolve().parents[2]),
     )
     real_stage_launcher = SshMultiMachineStageLauncher(
         vllm_repo_dir=args.gpu_vllm_repo_dir, machines=[gpu_machine], signaling_url=args.public_signaling_url,
