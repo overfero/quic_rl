@@ -137,6 +137,14 @@ def main() -> None:
                     help="setup_inference_machine.sh's own default build venv path ON THE GPU MACHINE")
     p.add_argument("--gpu-work-dir", required=True, help="path ON THE GPU MACHINE")
     p.add_argument("--gpu-driver-port", type=int, default=8080)
+    p.add_argument("--gpu-max-num-seqs", type=int, default=64,
+                    help="SshMultiMachineStageLauncher's own default (4) is tuned for quic-vllm's real "
+                         "multi-machine pipeline deployment, not one GRPO iteration's real concurrent batch "
+                         "(group_size x prompts_per_iteration completions all in flight at once) - confirmed "
+                         "directly this bottlenecks real throughput badly on an otherwise-idle T4")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                    help="same reasoning as --gpu-max-num-seqs - the launcher's own 0.5 default leaves real "
+                         "KV-cache headroom on the table for a single-model, single-GPU workload like this one")
     p.add_argument("--local-state-dir", required=True, help="path on THIS orchestrator's own machine")
     p.add_argument("--num-layers", type=int, default=28)
     p.add_argument("--group-size", type=int, default=16, help="matches jaygala24's own GRPO group size")
@@ -198,6 +206,13 @@ def main() -> None:
         vllm_repo_dir=args.gpu_vllm_repo_dir, machines=[gpu_machine], signaling_url=args.public_signaling_url,
         max_model_len=args.max_prompt_len + args.max_new_tokens, driver_port=args.gpu_driver_port,
         remote_log_dir=args.gpu_work_dir,
+        # See --gpu-max-num-seqs/--gpu-memory-utilization's own help text -
+        # the launcher's own defaults badly bottleneck a real GRPO batch
+        # (confirmed directly: max_num_seqs=4 forces group_size x
+        # prompts_per_iteration completions through in small serial
+        # batches instead of all at once on an otherwise-idle T4).
+        max_num_seqs=args.gpu_max_num_seqs, gpu_memory_utilization=args.gpu_memory_utilization,
+        num_gpu_blocks_override=None,
     )
     weight_synchronizer = QuicWeightSynchronizer(
         receiver=gpu_machine,

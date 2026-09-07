@@ -61,7 +61,15 @@ class SshMultiMachineStageLauncher:
     max_model_len: int = 2048
     max_num_seqs: int = 4
     gpu_memory_utilization: float = 0.5
-    num_gpu_blocks_override: int = 2000
+    # None = let vLLM compute this itself from real free GPU memory (via
+    # gpu_memory_utilization) - the real, correct default for a single
+    # model on its own GPU. 2000 (this class's OWN prior default, kept
+    # only for callers that relied on it) was tuned for quic-vllm's real
+    # multi-machine pipeline deployment (multiple stages sharing one
+    # GPU's memory budget, so an explicit cap matters there) - passing
+    # it through unconditionally in a single-stage, single-GPU topology
+    # like this one just leaves real KV-cache capacity on the table.
+    num_gpu_blocks_override: int | None = None
     rpc_port: int = 40100
     driver_port: int = 8080
     transport_connect_timeout: float = 300.0
@@ -160,7 +168,7 @@ class SshMultiMachineStageLauncher:
                     f"--gpu-memory-utilization {self.gpu_memory_utilization} "
                     f"--max-model-len {self.max_model_len} "
                     f"--max-num-seqs {self.max_num_seqs} "
-                    f"--num-gpu-blocks-override {self.num_gpu_blocks_override}"
+                    + (f"--num-gpu-blocks-override {self.num_gpu_blocks_override}" if self.num_gpu_blocks_override is not None else "")
                 )
             else:
                 # n==1 (this machine is the ONLY stage, e.g. the 2-machine
