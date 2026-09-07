@@ -41,6 +41,24 @@ class RemoteMachine:
     # TrainerMachine.ssh_alias for the identical pattern. Takes priority
     # over ssh_password when both are set (shouldn't be).
     ssh_alias: str | None = None
+    # Alternative to BOTH ssh_password and ssh_alias: run commands via
+    # quic_rl.synchronization.kv_remote_exec instead of SSH - for when the
+    # controller machine genuinely cannot reach this one over SSH (e.g. a
+    # freshly re-provisioned training machine hitting zrok's real
+    # cross-account 401 on `access private` to another account's share -
+    # see ARCHITECTURE.md's "Cross-machine coordination WITHOUT SSH").
+    # Set this to the shared public signaling URL; a kv_remote_exec watcher
+    # must already be running persistently on this machine (see that
+    # module's own docstring). Takes priority over ssh_alias/ssh_password
+    # when set.
+    kv_channel_signaling_url: str | None = None
+    # Required alongside kv_channel_signaling_url: this machine's own
+    # publicly-reachable driver URL (e.g. `zrok share public
+    # localhost:8080` run once on this machine) - a KV-relayed command
+    # channel has no equivalent to `ssh -L` port-forwarding, so the
+    # caller's HTTP client needs a real public URL instead of a local
+    # forwarded port.
+    public_driver_url: str | None = None
     cuda_device: str = "0"
 
 
@@ -84,6 +102,18 @@ class SshMultiMachineStageLauncher:
 
     _procs: dict[str, subprocess.Popen] = field(default_factory=dict, init=False, repr=False)
     _port_forward: subprocess.Popen | None = field(default=None, init=False, repr=False)
+    _kv_cmd_id: int = field(default=0, init=False, repr=False)
+
+    def _next_kv_cmd_id(self) -> int:
+        # Post-increment (not pre-) - the watcher's own default start_id is
+        # 0, so the FIRST command issued must be v0 too, or the watcher
+        # sits waiting for a v0 that never comes while the controller waits
+        # on a v1 result that never comes either (confirmed directly: this
+        # exact off-by-one deadlocked the very first real restart() call
+        # over the kv channel).
+        cmd_id = self._kv_cmd_id
+        self._kv_cmd_id += 1
+        return cmd_id
 
     def _ssh_prefix(self, m: RemoteMachine) -> list[str]:
         if m.ssh_alias is not None:
@@ -97,7 +127,24 @@ class SshMultiMachineStageLauncher:
         ]
 
     def _is_remote(self, m: RemoteMachine) -> bool:
-        return m.ssh_alias is not None or m.ssh_password is not None
+        return m.kv_channel_signaling_url is not None or m.ssh_alias is not None or m.ssh_password is not None
+
+    def _run_remote(self, m: RemoteMachine, cmd: str, *, cmd_id: int, timeout: float) -> None:
+        """Runs `cmd` on `m`, over SSH normally or via the KV command
+        channel when `m.kv_channel_signaling_url` is set (see that field's
+        own docstring). `cmd_id` must be unique per call on this channel -
+        see kv_remote_exec's own module docstring for why."""
+        if m.kv_channel_signaling_url is not None:
+            from quic_rl.synchronization.kv_remote_exec import run_remote_command
+
+            result = run_remote_command(
+                m.kv_channel_signaling_url, channel=f"stage_launcher_{m.name}",
+                cmd_id=cmd_id, cmd=cmd, timeout_s=timeout,
+            )
+            if result["returncode"] != 0:
+                raise RuntimeError(f"SshMultiMachineStageLauncher: command failed on {m.name} (kv channel): {cmd!r}\n{result['stderr']}")
+        else:
+            subprocess.run(self._ssh_prefix(m) + [cmd], timeout=timeout, check=True)
 
     def _env_prefix(self, m: RemoteMachine) -> str:
         return (
@@ -115,9 +162,24 @@ class SshMultiMachineStageLauncher:
             self._port_forward = None
         for m in self.machines:
             kill_cmd = (
-                "pkill -9 -f 'scripts/stage_server.py' 2>/dev/null; "
-                "pkill -9 -f 'vllm.entrypoints.cli.main' 2>/dev/null; "
-                "pkill -9 -f 'scripts/launch_pp_stage.py' 2>/dev/null; "
+                # Real bug found running this for real (over the kv_channel
+                # path, which - unlike the SSH path - actually checks this
+                # command's exit code): `pkill -f 'X'` matches against every
+                # process's FULL command line, including the invoking
+                # `bash -c "...X..."` shell itself, whose own argv contains
+                # the pattern text literally (it's right there in this
+                # string). That self-match SIGKILLs the shell running this
+                # very command chain before it reaches later pkill calls
+                # (confirmed directly: rc=-9, and real VLLM:: worker
+                # processes survived several "successful" restarts as a
+                # result). Fixed with the standard bracket-one-character
+                # trick (`[X]...` instead of `X...`) - the regex still
+                # matches the literal text in a REAL target process's
+                # cmdline, but no longer appears as that literal substring
+                # in the invoking shell's own argv, so it can't self-match.
+                "pkill -9 -f '[s]cripts/stage_server.py' 2>/dev/null; "
+                "pkill -9 -f '[v]llm.entrypoints.cli.main' 2>/dev/null; "
+                "pkill -9 -f '[s]cripts/launch_pp_stage.py' 2>/dev/null; "
                 # Real bug found running this for real: vLLM renames its own
                 # forked worker/engine-core subprocess titles via
                 # setproctitle (visible in `ps` as e.g. "VLLM::Worker",
@@ -130,16 +192,13 @@ class SshMultiMachineStageLauncher:
                 # "Free memory on device cuda:0 ... is less than desired GPU
                 # memory utilization" even though no vLLM process appeared
                 # to be running by the old patterns.
-                "pkill -9 -f 'VLLM::' 2>/dev/null; "
+                "pkill -9 -f '[V]LLM::' 2>/dev/null; "
                 "true"
             )
             if not self._is_remote(m):
                 subprocess.run(kill_cmd, shell=True)
             else:
-                subprocess.run(
-                    self._ssh_prefix(m) + [kill_cmd],
-                    timeout=20,
-                )
+                self._run_remote(m, kill_cmd, cmd_id=self._next_kv_cmd_id(), timeout=20)
         # Real observation running this for real: a worker process mid-CUDA-call
         # (e.g. VLLM::Worker_PP2 under GPU load) can take a few seconds to
         # actually die from SIGKILL, not the instant a signal usually implies -
@@ -229,16 +288,13 @@ class SshMultiMachineStageLauncher:
                 remote_full_cmd = (
                     f"{{ cd {self.vllm_repo_dir} && {cmd}; }} < /dev/null > {log_path} 2>&1 & disown; echo LAUNCHED_{m.name}"
                 )
-                subprocess.run(
-                    self._ssh_prefix(m) + [remote_full_cmd],
-                    timeout=20, check=True,
-                )
+                self._run_remote(m, remote_full_cmd, cmd_id=self._next_kv_cmd_id(), timeout=20)
 
             if not is_driver:
                 time.sleep(1.0)  # stagger listens-before-connects, matches validated manual runs
 
         driver = self.machines[-1]
-        if self._is_remote(driver):
+        if self._is_remote(driver) and driver.kv_channel_signaling_url is None:
             # The driver's HTTP API is only reachable from this orchestrator
             # process through the same SSH tunnel used to manage it - open
             # a local port-forward so QuicVLLMRollout's plain HTTP client
@@ -260,6 +316,13 @@ class SshMultiMachineStageLauncher:
             time.sleep(2.0)  # let the forward establish before the first request
 
     def driver_url(self) -> str:
+        # kv_channel machines have no SSH tunnel to forward through - they
+        # must publish their own real public URL instead (e.g. `zrok share
+        # public localhost:{driver_port}` run once on that machine - see
+        # RemoteMachine.public_driver_url's own docstring).
+        driver = self.machines[-1]
+        if driver.public_driver_url is not None:
+            return driver.public_driver_url
         return f"http://127.0.0.1:{self.driver_port}"
 
     def shutdown(self) -> None:

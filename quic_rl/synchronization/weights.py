@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 
@@ -93,6 +93,8 @@ class QuicWeightSynchronizer:
     remote_log_dir: str = "/kaggle/working"
     poll_interval_s: float = 2.0
 
+    _kv_cmd_id: int = field(default=0, init=False, repr=False)
+
     def _ssh_prefix(self, machine) -> list[str]:
         if machine is None:
             return []
@@ -107,6 +109,27 @@ class QuicWeightSynchronizer:
         ]
 
     def _run_ssh(self, machine, remote_cmd: str, timeout: float) -> str:
+        # Routes through quic_rl.synchronization.kv_remote_exec instead of
+        # SSH when `machine.kv_channel_signaling_url` is set - see
+        # RemoteMachine's own docstring and ARCHITECTURE.md's "Cross-machine
+        # coordination WITHOUT SSH" for why (real zrok cross-account 401 on
+        # `access private`, no local-relay allowed).
+        if getattr(machine, "kv_channel_signaling_url", None) is not None:
+            from quic_rl.synchronization.kv_remote_exec import run_remote_command
+
+            # Post-increment - the watcher's own default start_id is 0, so
+            # the FIRST command issued must be v0 too (see
+            # SshMultiMachineStageLauncher._next_kv_cmd_id's identical fix
+            # for the real off-by-one this pattern hit there).
+            cmd_id = self._kv_cmd_id
+            self._kv_cmd_id += 1
+            result = run_remote_command(
+                machine.kv_channel_signaling_url, channel=f"weight_sync_{machine.name}",
+                cmd_id=cmd_id, cmd=remote_cmd, timeout_s=timeout,
+            )
+            if result["returncode"] != 0:
+                raise RuntimeError(f"QuicWeightSynchronizer: command failed on {machine.name} (kv channel): {remote_cmd!r}\n{result['stderr']}")
+            return result["stdout"]
         proc = subprocess.run(
             self._ssh_prefix(machine) + [remote_cmd], timeout=timeout, check=True, capture_output=True, text=True,
         )
