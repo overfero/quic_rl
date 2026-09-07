@@ -317,6 +317,17 @@ def main() -> None:
             sampling=SamplingParams(temperature=1.0, max_tokens=args.max_new_tokens),
             state_dir=args.local_state_dir, metrics_path=f"{args.local_state_dir}/metrics.jsonl",
             wandb_project=args.wandb_project, wandb_run_name=args.wandb_run_name,
+            # Real bug found reading this path: Controller's own default
+            # (rollout_workers=1) sends QuicVLLMRollout.generate() ONE
+            # prompt at a time - group_size (n) samples of the SAME prompt
+            # are genuinely parallel (vLLM's own `n` param, one request),
+            # but different prompts within one iteration were serialized
+            # through the same blocking HTTP call, leaving most of the
+            # rollout machine's real verified concurrency (24x at the
+            # current 9216-token cap) idle. One worker per prompt fans all
+            # of them out concurrently via collect_rollouts()'s own
+            # ThreadPoolExecutor path instead.
+            rollout_workers=args.prompts_per_iteration,
         )
         controller.resume_or_start(initial_version)
 
