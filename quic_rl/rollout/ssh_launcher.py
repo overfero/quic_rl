@@ -117,6 +117,20 @@ class SshMultiMachineStageLauncher:
             kill_cmd = (
                 "pkill -9 -f 'scripts/stage_server.py' 2>/dev/null; "
                 "pkill -9 -f 'vllm.entrypoints.cli.main' 2>/dev/null; "
+                "pkill -9 -f 'scripts/launch_pp_stage.py' 2>/dev/null; "
+                # Real bug found running this for real: vLLM renames its own
+                # forked worker/engine-core subprocess titles via
+                # setproctitle (visible in `ps` as e.g. "VLLM::Worker",
+                # "VLLM::EngineCore") - /proc/<pid>/cmdline no longer
+                # contains "vllm.entrypoints.cli.main" once that happens, so
+                # the pattern above never matches them. One such orphan sat
+                # holding ~12.8GB of GPU memory through several supposedly
+                # clean restarts, causing a LATER launch attempt (a
+                # different, real GPU config) to fail outright with
+                # "Free memory on device cuda:0 ... is less than desired GPU
+                # memory utilization" even though no vLLM process appeared
+                # to be running by the old patterns.
+                "pkill -9 -f 'VLLM::' 2>/dev/null; "
                 "true"
             )
             if not self._is_remote(m):
