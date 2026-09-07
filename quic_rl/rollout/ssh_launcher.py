@@ -58,6 +58,12 @@ class SshMultiMachineStageLauncher:
     # comment for why (real vllm/torch version conflict, not a style
     # preference).
     vllm_venv_python: str = "/vllm_build_venv/bin/python3"
+    # 1 = single-GPU (whatever RemoteMachine.cuda_device names). >1 = tensor
+    # parallelism across that many GPUs on this same machine - RemoteMachine
+    # .cuda_device must then be a comma list matching this count (e.g. "0,1"
+    # for tensor_parallel_size=2), so both real GPUs on a 2xT4 box are used
+    # instead of leaving the second one fully idle.
+    tensor_parallel_size: int = 1
     max_model_len: int = 2048
     max_num_seqs: int = 4
     gpu_memory_utilization: float = 0.5
@@ -164,7 +170,7 @@ class SshMultiMachineStageLauncher:
                     f"--transport quic --signaling-url {self.signaling_url} "
                     f"--transport-connect-timeout {self.transport_connect_timeout} "
                     f"--rpc-port {self.rpc_port} --rpc-listen-host 0.0.0.0 "
-                    f"--model {stage_dir} --tensor-parallel-size 1 --dtype float16 "
+                    f"--model {stage_dir} --tensor-parallel-size {self.tensor_parallel_size} --dtype float16 "
                     f"--gpu-memory-utilization {self.gpu_memory_utilization} "
                     f"--max-model-len {self.max_model_len} "
                     f"--max-num-seqs {self.max_num_seqs} "
@@ -191,7 +197,7 @@ class SshMultiMachineStageLauncher:
                     + (f"--prev-name {prev_name} " if prev_name else "")
                     + f"--transport quic --signaling-url {self.signaling_url} "
                     f"--transport-connect-timeout {self.transport_connect_timeout} "
-                    f"--model {stage_dir} --tensor-parallel-size 1 --dtype float16 "
+                    f"--model {stage_dir} --tensor-parallel-size {self.tensor_parallel_size} --dtype float16 "
                     f"--gpu-memory-utilization {self.gpu_memory_utilization} "
                     f"--max-model-len {self.max_model_len} "
                     f"--max-num-seqs {self.max_num_seqs} "

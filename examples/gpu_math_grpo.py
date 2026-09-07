@@ -137,6 +137,9 @@ def main() -> None:
                     help="setup_inference_machine.sh's own default build venv path ON THE GPU MACHINE")
     p.add_argument("--gpu-work-dir", required=True, help="path ON THE GPU MACHINE")
     p.add_argument("--gpu-driver-port", type=int, default=8080)
+    p.add_argument("--gpu-tensor-parallel-size", type=int, default=2,
+                    help="the rollout machine has 2xT4 - default uses both via real tensor parallelism instead "
+                         "of leaving the second GPU fully idle. Set to 1 to pin to a single GPU (cuda_device 0).")
     p.add_argument("--gpu-max-num-seqs", type=int, default=64,
                     help="SshMultiMachineStageLauncher's own default (4) is tuned for quic-vllm's real "
                          "multi-machine pipeline deployment, not one GRPO iteration's real concurrent batch "
@@ -186,7 +189,8 @@ def main() -> None:
         name="tpu", ssh_alias=args.tpu_ssh_alias, cuda_devices=["0"],
         quic_dist_repo_dir=args.tpu_quic_dist_repo_dir, state_dir=args.tpu_state_dir,
     )
-    gpu_machine = RemoteMachine(name="gpu", ssh_alias=args.gpu_ssh_alias)
+    gpu_cuda_device = ",".join(str(i) for i in range(args.gpu_tensor_parallel_size))
+    gpu_machine = RemoteMachine(name="gpu", ssh_alias=args.gpu_ssh_alias, cuda_device=gpu_cuda_device)
 
     trainer = SshMultiMachineTrainBackend(
         machines=[tpu_machine],
@@ -212,7 +216,7 @@ def main() -> None:
         # prompts_per_iteration completions through in small serial
         # batches instead of all at once on an otherwise-idle T4).
         max_num_seqs=args.gpu_max_num_seqs, gpu_memory_utilization=args.gpu_memory_utilization,
-        num_gpu_blocks_override=None,
+        num_gpu_blocks_override=None, tensor_parallel_size=args.gpu_tensor_parallel_size,
     )
     weight_synchronizer = QuicWeightSynchronizer(
         receiver=gpu_machine,
