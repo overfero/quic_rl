@@ -155,9 +155,12 @@ def main() -> None:
                     help="real dataset (gsm8k_train+math_train, ~20k examples) needs a real batch size per "
                          "iteration to finish in a tractable step count - see --max-iterations' own help")
     p.add_argument("--max-prompt-len", type=int, default=512)
-    p.add_argument("--max-new-tokens", type=int, default=7680,
-                    help="default + --max-prompt-len (512) = 8192 total context - maximizes real usable "
-                         "context for this small a model instead of leaving headroom unused")
+    p.add_argument("--max-new-tokens", type=int, default=8192,
+                    help="real output budget - 8192 max generated tokens per completion. Total context "
+                         "(vLLM's --max-model-len) is this + --max-prompt-len = 8704, so the model's own "
+                         "position budget covers prompt + full 8k output with room to spare, never truncating "
+                         "the output itself. Qwen3-1.7B's real max_position_embeddings is 40960, so this still "
+                         "leaves plenty of headroom.")
     p.add_argument("--num-examples", type=int, default=None,
                     help="None (default) = the FULL combined gsm8k_train+math_train dataset, not a slice")
     p.add_argument("--max-iterations", type=int, default=None,
