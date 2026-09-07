@@ -155,7 +155,9 @@ def main() -> None:
                     help="real dataset (gsm8k_train+math_train, ~20k examples) needs a real batch size per "
                          "iteration to finish in a tractable step count - see --max-iterations' own help")
     p.add_argument("--max-prompt-len", type=int, default=512)
-    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument("--max-new-tokens", type=int, default=7680,
+                    help="default + --max-prompt-len (512) = 8192 total context - maximizes real usable "
+                         "context for this small a model instead of leaving headroom unused")
     p.add_argument("--num-examples", type=int, default=None,
                     help="None (default) = the FULL combined gsm8k_train+math_train dataset, not a slice")
     p.add_argument("--max-iterations", type=int, default=None,

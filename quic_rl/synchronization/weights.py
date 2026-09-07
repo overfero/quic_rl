@@ -156,6 +156,16 @@ class QuicWeightSynchronizer:
         self.stage_launcher.restart(f"{self.remote_policy_root}/v{policy_version}")
         reload_time_s = time.monotonic() - t_reload0
 
+        # Real gap found running this for real: nothing ever deleted an old
+        # v{N}/ policy directory on the receiver after restart() switched
+        # over to the new one - each is a full multi-GB model checkpoint, so
+        # a real multi-thousand-iteration run fills the receiver's disk and
+        # crashes partway through. Safe to delete everything except the
+        # version just loaded: restart() only reads from disk at process
+        # startup, never during serving, so once it has returned the old
+        # directories are dead weight.
+        self._cleanup_stale_policy_versions(policy_version)
+
         sync_time_s = time.monotonic() - t_sync0
         return SyncResult(
             policy_version=policy_version,
@@ -165,6 +175,22 @@ class QuicWeightSynchronizer:
             reload_time_s=reload_time_s,
             total_overhead_s=sync_time_s,
         )
+
+    def _cleanup_stale_policy_versions(self, keep_version: int) -> None:
+        # `find ... -maxdepth 1 -name 'v*' ! -name v{keep}` rather than a
+        # glob-in-shell so it never matches a partially-written vN dir from
+        # a still-in-flight transfer (there shouldn't be one - restart()
+        # above only returns after the current version's own transfer is
+        # fully acked - but this is the disk-destroying half of the
+        # operation, so it stays as narrowly scoped as possible on purpose).
+        cleanup_cmd = (
+            f"find {self.remote_policy_root} -maxdepth 1 -type d -name 'v*' "
+            f"! -name v{keep_version} -exec rm -rf {{}} + 2>/dev/null; true"
+        )
+        try:
+            self._run_ssh(self.receiver, cleanup_cmd, timeout=60)
+        except subprocess.CalledProcessError:
+            pass  # best-effort - a failed cleanup must never fail the sync() call itself
 
     def _send(self, policy_dir: str, job_id: str, policy_version: int) -> int:
         """Returns the transferred total_bytes. In-process for
