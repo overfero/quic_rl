@@ -163,7 +163,7 @@ def main() -> None:
                     help="export+upload the running 'last' checkpoint to Drive every this many iterations - "
                          "every iteration would be a genuine multi-GB export+upload each time, real overhead "
                          "this project explicitly asked to keep low (\"efisiensikan pipeline\")")
-    p.add_argument("--gdrive-folder", default="Models/quic_rl_gpu_math_grpo",
+    p.add_argument("--gdrive-folder", default="Models/Qwen3-1.7B-GRPO-math-recreation",
                     help="path under the TPU machine's own rclone 'gdrive:' remote - holds only best/ and last/, "
                          "each ever ONE checkpoint (the old one is deleted right after a new upload succeeds)")
     p.add_argument("--wandb-project", default=None)
