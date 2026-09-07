@@ -5,3 +5,4 @@ __pycache__/
 build/
 quic_rl_state/
 *.jsonl
+.secrets/
