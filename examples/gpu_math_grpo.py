@@ -145,9 +145,10 @@ def main() -> None:
                          "multi-machine pipeline deployment, not one GRPO iteration's real concurrent batch "
                          "(group_size x prompts_per_iteration completions all in flight at once) - confirmed "
                          "directly this bottlenecks real throughput badly on an otherwise-idle T4")
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.95,
                     help="same reasoning as --gpu-max-num-seqs - the launcher's own 0.5 default leaves real "
-                         "KV-cache headroom on the table for a single-model, single-GPU workload like this one")
+                         "KV-cache headroom on the table for a single-model, single-GPU workload like this one. "
+                         "0.95 (not 1.0) still leaves a small margin for CUDA context/allocator overhead")
     p.add_argument("--local-state-dir", required=True, help="path on THIS orchestrator's own machine")
     p.add_argument("--num-layers", type=int, default=28)
     p.add_argument("--group-size", type=int, default=16, help="matches jaygala24's own GRPO group size")
@@ -211,9 +212,18 @@ def main() -> None:
         # docstring for why the remote-path default is wrong here.
         local_quic_dist_parent_dir=str(Path(__file__).resolve().parents[2]),
     )
+    # The rollout server's own serving cap must stay strictly ABOVE what
+    # training will ever actually request (prompt + max_new_tokens) - a
+    # margin exactly equal to that sum leaves zero room for chat-template/
+    # special-token overhead added on top of the raw prompt, which would
+    # silently truncate real generations right at the boundary instead of
+    # ever hitting max_new_tokens cleanly. ROLLOUT_CONTEXT_MARGIN keeps
+    # vLLM's real ceiling comfortably above training's real requirement.
+    ROLLOUT_CONTEXT_MARGIN = 512
     real_stage_launcher = SshMultiMachineStageLauncher(
         vllm_repo_dir=args.gpu_vllm_repo_dir, machines=[gpu_machine], signaling_url=args.public_signaling_url,
-        max_model_len=args.max_prompt_len + args.max_new_tokens, driver_port=args.gpu_driver_port,
+        max_model_len=args.max_prompt_len + args.max_new_tokens + ROLLOUT_CONTEXT_MARGIN,
+        driver_port=args.gpu_driver_port,
         remote_log_dir=args.gpu_work_dir,
         # See --gpu-max-num-seqs/--gpu-memory-utilization's own help text -
         # the launcher's own defaults badly bottleneck a real GRPO batch
