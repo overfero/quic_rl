@@ -197,7 +197,7 @@ class SshMultiMachineStageLauncher:
                     f"--max-num-seqs {self.max_num_seqs} "
                     f"--serve --host 0.0.0.0 --port {self.driver_port} "
                     + (f"--remote-stage-names {remote_names} --rpc-port {self.rpc_port} " if remote_names else "")
-                    + f"--num-gpu-blocks-override {self.num_gpu_blocks_override}"
+                    + (f"--num-gpu-blocks-override {self.num_gpu_blocks_override}" if self.num_gpu_blocks_override is not None else "")
                 )
 
             log_path = f"{self.remote_log_dir}/quic_rl_stage_{m.name}.log"
